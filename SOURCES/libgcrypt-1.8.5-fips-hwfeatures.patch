@@ -1,0 +1,13 @@
+diff -up libgcrypt-1.8.5/src/hwfeatures.c.hw-fips libgcrypt-1.8.5/src/hwfeatures.c
+--- libgcrypt-1.8.5/src/hwfeatures.c.hw-fips	2021-06-25 11:55:55.843819137 +0200
++++ libgcrypt-1.8.5/src/hwfeatures.c	2021-06-25 11:56:00.925895390 +0200
+@@ -205,9 +205,6 @@ _gcry_detect_hw_features (void)
+ {
+   hw_features = 0;
+ 
+-  if (fips_mode ())
+-    return; /* Hardware support is not to be evaluated.  */
+-
+   parse_hwf_deny_file ();
+ 
+ #if defined (HAVE_CPU_ARCH_X86)

@@ -1,0 +1,274 @@
+diff --git a/cipher/crc-ppc.c b/cipher/crc-ppc.c
+index 4d7f0add..b9a40130 100644
+--- a/cipher/crc-ppc.c
++++ b/cipher/crc-ppc.c
+@@ -154,26 +154,63 @@ static const vector16x_u8 bswap_const ALIGNED_64 =
+ #ifdef WORDS_BIGENDIAN
+ # define CRC_VEC_U64_DEF(lo, hi) { (hi), (lo) }
+ # define CRC_VEC_U64_LOAD(offs, ptr) \
+-          asm_swap_u64(vec_vsx_ld((offs), (const unsigned long long *)(ptr)))
++	  asm_swap_u64(asm_vec_u64_load(offs, ptr))
+ # define CRC_VEC_U64_LOAD_LE(offs, ptr) \
+-	  CRC_VEC_SWAP(vec_vsx_ld((offs), (const unsigned long long *)(ptr)))
++	  CRC_VEC_SWAP(asm_vec_u64_load(offs, ptr))
+ # define CRC_VEC_U64_LOAD_BE(offs, ptr) \
+-         vec_vsx_ld((offs), (const unsigned long long *)(ptr))
++	  asm_vec_u64_load(offs, ptr)
+ # define CRC_VEC_SWAP_TO_LE(v) CRC_VEC_SWAP(v)
+ # define CRC_VEC_SWAP_TO_BE(v) (v)
+ # define VEC_U64_LO 1
+ # define VEC_U64_HI 0
++
++static ASM_FUNC_ATTR_INLINE vector2x_u64
++asm_vec_u64_load(unsigned long offset, const void *ptr)
++{
++  vector2x_u64 vecu64;
++#if __GNUC__ >= 4
++  if (__builtin_constant_p (offset) && offset == 0)
++    __asm__ volatile ("lxvd2x %x0,0,%1\n\t"
++		      : "=wa" (vecu64)
++		      : "r" ((uintptr_t)ptr)
++		      : "memory");
++  else
++#endif
++    __asm__ volatile ("lxvd2x %x0,%1,%2\n\t"
++		      : "=wa" (vecu64)
++		      : "r" (offset), "r" ((uintptr_t)ptr)
++		      : "memory", "r0");
++  return vecu64;
++}
+ #else
+ # define CRC_VEC_U64_DEF(lo, hi) { (lo), (hi) }
+-# define CRC_VEC_U64_LOAD(offs, ptr) \
+-	  vec_vsx_ld((offs), (const unsigned long long *)(ptr))
+-# define CRC_VEC_U64_LOAD_LE(offs, ptr) CRC_VEC_U64_LOAD((offs), (ptr))
++# define CRC_VEC_U64_LOAD(offs, ptr) asm_vec_u64_load_le(offs, ptr)
++# define CRC_VEC_U64_LOAD_LE(offs, ptr) asm_vec_u64_load_le(offs, ptr)
+ # define CRC_VEC_U64_LOAD_BE(offs, ptr) asm_vec_u64_load_be(offs, ptr)
+ # define CRC_VEC_SWAP_TO_LE(v) (v)
+ # define CRC_VEC_SWAP_TO_BE(v) CRC_VEC_SWAP(v)
+ # define VEC_U64_LO 0
+ # define VEC_U64_HI 1
+ 
++static ASM_FUNC_ATTR_INLINE vector2x_u64
++asm_vec_u64_load_le(unsigned long offset, const void *ptr)
++{
++  vector2x_u64 vecu64;
++#if __GNUC__ >= 4
++  if (__builtin_constant_p (offset) && offset == 0)
++    __asm__ volatile ("lxvd2x %x0,0,%1\n\t"
++		      : "=wa" (vecu64)
++		      : "r" ((uintptr_t)ptr)
++		      : "memory");
++  else
++#endif
++    __asm__ volatile ("lxvd2x %x0,%1,%2\n\t"
++		      : "=wa" (vecu64)
++		      : "r" (offset), "r" ((uintptr_t)ptr)
++		      : "memory", "r0");
++  return asm_swap_u64(vecu64);
++}
++
+ static ASM_FUNC_ATTR_INLINE vector2x_u64
+ asm_vec_u64_load_be(unsigned int offset, const void *ptr)
+ {
+diff --git a/cipher/sha512-ppc.c b/cipher/sha512-ppc.c
+index a758e1ea..31ea25bf 100644
+--- a/cipher/sha512-ppc.c
++++ b/cipher/sha512-ppc.c
+@@ -115,14 +115,62 @@ vec_merge_idx0_elems(vector2x_u64 v0, vector2x_u64 v1)
+ static ASM_FUNC_ATTR_INLINE vector2x_u64
+ vec_vshasigma_u64(vector2x_u64 v, unsigned int a, unsigned int b)
+ {
+-  asm ("vshasigmad %0,%1,%2,%3"
+-       : "=v" (v)
+-       : "v" (v), "g" (a), "g" (b)
+-       : "memory");
++  __asm__ ("vshasigmad %0,%1,%2,%3"
++	   : "=v" (v)
++	   : "v" (v), "g" (a), "g" (b)
++	   : "memory");
+   return v;
+ }
+ 
+ 
++static ASM_FUNC_ATTR_INLINE vector2x_u64
++vec_u64_load(unsigned long offset, const void *ptr)
++{
++  vector2x_u64 vecu64;
++#if __GNUC__ >= 4
++  if (__builtin_constant_p (offset) && offset == 0)
++    __asm__ ("lxvd2x %x0,0,%1\n\t"
++	     : "=wa" (vecu64)
++	     : "r" ((uintptr_t)ptr)
++	     : "memory");
++  else
++#endif
++    __asm__ ("lxvd2x %x0,%1,%2\n\t"
++	     : "=wa" (vecu64)
++	     : "r" (offset), "r" ((uintptr_t)ptr)
++	     : "memory", "r0");
++#ifndef WORDS_BIGENDIAN
++  __asm__ ("xxswapd %x0, %x1"
++	   : "=wa" (vecu64)
++	   : "wa" (vecu64));
++#endif
++  return vecu64;
++}
++
++
++static ASM_FUNC_ATTR_INLINE void
++vec_u64_store(vector2x_u64 vecu64, unsigned long offset, void *ptr)
++{
++#ifndef WORDS_BIGENDIAN
++  __asm__ ("xxswapd %x0, %x1"
++	   : "=wa" (vecu64)
++	   : "wa" (vecu64));
++#endif
++#if __GNUC__ >= 4
++  if (__builtin_constant_p (offset) && offset == 0)
++    __asm__ ("stxvd2x %x0,0,%1\n\t"
++	     :
++	     : "wa" (vecu64), "r" ((uintptr_t)ptr)
++	     : "memory");
++  else
++#endif
++    __asm__ ("stxvd2x %x0,%1,%2\n\t"
++	     :
++	     : "wa" (vecu64), "r" (offset), "r" ((uintptr_t)ptr)
++	     : "memory", "r0");
++}
++
++
+ /* SHA2 round in vector registers */
+ #define R(a,b,c,d,e,f,g,h,k,w) do                             \
+     {                                                         \
+@@ -168,13 +216,13 @@ _gcry_sha512_transform_ppc8(u64 state[8],
+   vector2x_u64 a, b, c, d, e, f, g, h, t1, t2;
+   u64 w[16];
+ 
+-  h0 = vec_vsx_ld (8 * 0, (unsigned long long *)state);
++  h0 = vec_u64_load (8 * 0, (unsigned long long *)state);
+   h1 = vec_rol_elems (h0, 1);
+-  h2 = vec_vsx_ld (8 * 2, (unsigned long long *)state);
++  h2 = vec_u64_load (8 * 2, (unsigned long long *)state);
+   h3 = vec_rol_elems (h2, 1);
+-  h4 = vec_vsx_ld (8 * 4, (unsigned long long *)state);
++  h4 = vec_u64_load (8 * 4, (unsigned long long *)state);
+   h5 = vec_rol_elems (h4, 1);
+-  h6 = vec_vsx_ld (8 * 6, (unsigned long long *)state);
++  h6 = vec_u64_load (8 * 6, (unsigned long long *)state);
+   h7 = vec_rol_elems (h6, 1);
+ 
+   while (nblks >= 2)
+@@ -514,10 +562,10 @@ _gcry_sha512_transform_ppc8(u64 state[8],
+   h2 = vec_merge_idx0_elems (h2, h3);
+   h4 = vec_merge_idx0_elems (h4, h5);
+   h6 = vec_merge_idx0_elems (h6, h7);
+-  vec_vsx_st (h0, 8 * 0, (unsigned long long *)state);
+-  vec_vsx_st (h2, 8 * 2, (unsigned long long *)state);
+-  vec_vsx_st (h4, 8 * 4, (unsigned long long *)state);
+-  vec_vsx_st (h6, 8 * 6, (unsigned long long *)state);
++  vec_u64_store (h0, 8 * 0, (unsigned long long *)state);
++  vec_u64_store (h2, 8 * 2, (unsigned long long *)state);
++  vec_u64_store (h4, 8 * 4, (unsigned long long *)state);
++  vec_u64_store (h6, 8 * 6, (unsigned long long *)state);
+ 
+   return sizeof(w);
+ }
+diff --git a/configure.ac b/configure.ac
+index b6b6455a..be35ce42 100644
+--- a/configure.ac
++++ b/configure.ac
+@@ -1745,10 +1745,12 @@ AC_CACHE_CHECK([whether compiler supports PowerPC AltiVec/VSX intrinsics],
+ 	AC_COMPILE_IFELSE([AC_LANG_SOURCE(
+ 	[[#include <altivec.h>
+ 	  typedef vector unsigned char block;
++	  typedef vector unsigned int vecu32;
+ 	  block fn(block in)
+ 	  {
+ 	    block t = vec_perm (in, in, vec_vsx_ld (0, (unsigned char*)0));
+-	    return vec_cipher_be (t, in);
++	    vecu32 y = vec_vsx_ld (0, (unsigned int*)0);
++	    return vec_cipher_be (t, in) ^ (block)y;
+ 	  }
+ 	  ]])],
+ 	[gcry_cv_cc_ppc_altivec=yes])
+@@ -1769,10 +1771,12 @@ if test "$gcry_cv_cc_ppc_altivec" = "no" &&
+     AC_COMPILE_IFELSE([AC_LANG_SOURCE(
+       [[#include <altivec.h>
+ 	typedef vector unsigned char block;
++	typedef vector unsigned int vecu32;
+ 	block fn(block in)
+ 	{
+ 	  block t = vec_perm (in, in, vec_vsx_ld (0, (unsigned char*)0));
+-	  return vec_cipher_be (t, in);
++	  vecu32 y = vec_vsx_ld (0, (unsigned int*)0);
++	  return vec_cipher_be (t, in) ^ (block)y;
+ 	}]])],
+       [gcry_cv_cc_ppc_altivec_cflags=yes])])
+   if test "$gcry_cv_cc_ppc_altivec_cflags" = "yes" ; then
+
+diff --git a/configure.ac b/configure.ac
+index 202ac888..fd447906 100644
+--- a/configure.ac
++++ b/configure.ac
+@@ -2562,13 +2562,13 @@ if test "$found" = "1" ; then
+          GCRYPT_DIGESTS="$GCRYPT_DIGESTS crc-intel-pclmul.lo"
+       ;;
+       powerpc64le-*-*)
+-         GCRYPT_CIPHERS="$GCRYPT_CIPHERS crc-ppc.lo"
++         GCRYPT_DIGESTS="$GCRYPT_DIGESTS crc-ppc.lo"
+       ;;
+       powerpc64-*-*)
+-         GCRYPT_CIPHERS="$GCRYPT_CIPHERS crc-ppc.lo"
++         GCRYPT_DIGESTS="$GCRYPT_DIGESTS crc-ppc.lo"
+       ;;
+       powerpc-*-*)
+-         GCRYPT_CIPHERS="$GCRYPT_CIPHERS crc-ppc.lo"
++         GCRYPT_DIGESTS="$GCRYPT_DIGESTS crc-ppc.lo"
+       ;;
+    esac
+ fi
+@@ -2635,17 +2635,17 @@ if test "$found" = "1" ; then
+       ;;
+       powerpc64le-*-*)
+          # Build with the crypto extension implementation
+-         GCRYPT_CIPHERS="$GCRYPT_CIPHERS sha256-ppc.lo"
++         GCRYPT_DIGESTS="$GCRYPT_DIGESTS sha256-ppc.lo"
+       ;;
+       powerpc64-*-*)
+          # Big-Endian.
+          # Build with the crypto extension implementation
+-         GCRYPT_CIPHERS="$GCRYPT_CIPHERS sha256-ppc.lo"
++         GCRYPT_DIGESTS="$GCRYPT_DIGESTS sha256-ppc.lo"
+       ;;
+       powerpc-*-*)
+          # Big-Endian.
+          # Build with the crypto extension implementation
+-         GCRYPT_CIPHERS="$GCRYPT_CIPHERS sha256-ppc.lo"
++         GCRYPT_DIGESTS="$GCRYPT_DIGESTS sha256-ppc.lo"
+    esac
+ fi
+ 
+@@ -2667,17 +2667,17 @@ if test "$found" = "1" ; then
+       ;;
+       powerpc64le-*-*)
+          # Build with the crypto extension implementation
+-         GCRYPT_CIPHERS="$GCRYPT_CIPHERS sha512-ppc.lo"
++         GCRYPT_DIGESTS="$GCRYPT_DIGESTS sha512-ppc.lo"
+       ;;
+       powerpc64-*-*)
+          # Big-Endian.
+          # Build with the crypto extension implementation
+-         GCRYPT_CIPHERS="$GCRYPT_CIPHERS sha512-ppc.lo"
++         GCRYPT_DIGESTS="$GCRYPT_DIGESTS sha512-ppc.lo"
+       ;;
+       powerpc-*-*)
+          # Big-Endian.
+          # Build with the crypto extension implementation
+-         GCRYPT_CIPHERS="$GCRYPT_CIPHERS sha512-ppc.lo"
++         GCRYPT_DIGESTS="$GCRYPT_DIGESTS sha512-ppc.lo"
+    esac
+ 
+    if test x"$neonsupport" = xyes ; then

@@ -1,0 +1,158 @@
+diff -up libgcrypt-1.8.5/cipher/kdf.c.kdf-selftest libgcrypt-1.8.5/cipher/kdf.c
+--- libgcrypt-1.8.5/cipher/kdf.c.kdf-selftest	2017-11-23 19:16:58.000000000 +0100
++++ libgcrypt-1.8.5/cipher/kdf.c	2020-06-15 18:14:26.494995669 +0200
+@@ -305,3 +305,99 @@ _gcry_kdf_derive (const void *passphrase
+  leave:
+   return ec;
+ }
++
++
++/* PBKDF2 selftests.
++ * Copyright (C) 2008 Free Software Foundation, Inc.
++ * Copyright (C) 2019, 2020 Red Hat, Inc.
++ */
++
++/* Check one PBKDF2 call with HASH ALGO using the regular KDF
++ * API. (passphrase,passphraselen) is the password to be derived,
++ * (salt,saltlen) the salt for the key derivation,
++ * iterations is the number of the kdf iterations,
++ * and (expect,expectlen) the expected result. Returns NULL on
++ * success or a string describing the failure.  */
++
++static const char *
++check_one (int algo,
++           const void *passphrase, size_t passphraselen,
++           const void *salt, size_t saltlen,
++           unsigned long iterations,
++           const void *expect, size_t expectlen)
++{
++  unsigned char key[512]; /* hardcoded to avoid allocation */
++  size_t keysize = expectlen;
++
++  if (keysize > sizeof(key))
++    return "invalid tests data";
++
++  if (_gcry_kdf_derive (passphrase, passphraselen, GCRY_KDF_PBKDF2,
++                        algo, salt, saltlen, iterations,
++                         keysize, key))
++    return "gcry_kdf_derive failed";
++
++  if (memcmp (key, expect, expectlen))
++    return "does not match";
++
++  return NULL;
++}
++
++static gpg_err_code_t
++run_pbkdf2_selftest (int extended, selftest_report_func_t report)
++{
++  const char *what;
++  const char *errtxt;
++
++  what = "Basic PBKDF2 SHA256";
++  errtxt = check_one (GCRY_MD_SHA256,
++        "password", 8,
++        "salt", 4,
++        2,
++        "\xae\x4d\x0c\x95\xaf\x6b\x46\xd3\x2d\x0a\xdf\xf9\x28\xf0\x6d\xd0"
++        "\x2a\x30\x3f\x8e\xf3\xc2\x51\xdf\xd6\xe2\xd8\x5a\x95\x47\x4c\x43", 32);
++  if (errtxt)
++    goto failed;
++
++  if (extended)
++    {
++      what = "Extended PBKDF2 SHA256";
++      errtxt = check_one (GCRY_MD_SHA256,
++        "passwordPASSWORDpassword", 24,
++        "saltSALTsaltSALTsaltSALTsaltSALTsalt", 36,
++        4096,
++        "\x34\x8c\x89\xdb\xcb\xd3\x2b\x2f\x32\xd8\x14\xb8\x11\x6e\x84\xcf"
++        "\x2b\x17\x34\x7e\xbc\x18\x00\x18\x1c\x4e\x2a\x1f\xb8\xdd\x53\xe1"
++        "\xc6\x35\x51\x8c\x7d\xac\x47\xe9", 40);
++      if (errtxt)
++        goto failed;
++    }
++
++  return 0; /* Succeeded. */
++
++ failed:
++  if (report)
++    report ("kdf", GCRY_KDF_PBKDF2, what, errtxt);
++  return GPG_ERR_SELFTEST_FAILED;
++}
++
++
++/* Run the selftests for KDF with KDF algorithm ALGO with optional
++   reporting function REPORT.  */
++gpg_error_t
++_gcry_kdf_selftest (int algo, int extended, selftest_report_func_t report)
++{
++  gcry_err_code_t ec = 0;
++
++  if (algo == GCRY_KDF_PBKDF2)
++    {
++      ec = run_pbkdf2_selftest (extended, report);
++    }
++  else
++    {
++      ec = GPG_ERR_UNSUPPORTED_ALGORITHM;
++      if (report)
++        report ("kdf", algo, "module", "algorithm not available");
++    }
++  return gpg_error (ec);
++}
+diff -up libgcrypt-1.8.5/src/cipher-proto.h.kdf-selftest libgcrypt-1.8.5/src/cipher-proto.h
+--- libgcrypt-1.8.5/src/cipher-proto.h.kdf-selftest	2020-06-15 18:03:25.785353036 +0200
++++ libgcrypt-1.8.5/src/cipher-proto.h	2020-06-15 18:03:25.788353061 +0200
+@@ -259,6 +259,8 @@ gcry_error_t _gcry_hmac_selftest (int al
+                                   selftest_report_func_t report);
+ gcry_error_t _gcry_cmac_selftest (int algo, int extended,
+                                   selftest_report_func_t report);
++gcry_error_t _gcry_kdf_selftest (int algo, int extended,
++                                  selftest_report_func_t report);
+ 
+ gcry_error_t _gcry_random_selftest (selftest_report_func_t report);
+ 
+diff -up libgcrypt-1.8.5/src/fips.c.kdf-selftest libgcrypt-1.8.5/src/fips.c
+--- libgcrypt-1.8.5/src/fips.c.kdf-selftest	2020-06-15 18:03:25.777352968 +0200
++++ libgcrypt-1.8.5/src/fips.c	2020-06-15 18:08:40.651028096 +0200
+@@ -490,6 +490,29 @@ run_mac_selftests (int extended)
+   return anyerr;
+ }
+ 
++/* Run self-tests for all KDF algorithms.  Return 0 on success. */
++static int
++run_kdf_selftests (int extended)
++{
++  static int algos[] =
++    {
++      GCRY_KDF_PBKDF2,
++      0
++    };
++  int idx;
++  gpg_error_t err;
++  int anyerr = 0;
++
++  for (idx=0; algos[idx]; idx++)
++    {
++      err = _gcry_kdf_selftest (algos[idx], extended, reporter);
++      reporter ("kdf", algos[idx], NULL, err? gpg_strerror (err):NULL);
++      if (err)
++        anyerr = 1;
++    }
++  return anyerr;
++}
++
+ 
+ /* Run self-tests for all required public key algorithms.  Return 0 on
+    success. */
+@@ -673,6 +696,9 @@ _gcry_fips_run_selftests (int extended)
+   if (run_mac_selftests (extended))
+     goto leave;
+ 
++  if (run_kdf_selftests (extended))
++    goto leave;
++
+   /* Run random tests before the pubkey tests because the latter
+      require random.  */
+   if (run_random_selftests ())
