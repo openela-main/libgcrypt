@@ -1,0 +1,55 @@
+From c34c9e70055ee43e5ef257384fa15941f064e5a4 Mon Sep 17 00:00:00 2001
+From: Jakub Jelen <jjelen@redhat.com>
+Date: Tue, 15 Nov 2022 10:47:18 +0100
+Subject: [PATCH] fips: Mark AES key wrapping as approved.
+
+* src/fips.c (_gcry_fips_indicator_cipher): Add key wrapping mode as
+approved.
+
+--
+
+GnuPG-bug-id: 5512
+Signed-off-by: Jakub Jelen <jjelen@redhat.com>
+---
+ src/fips.c | 1 +
+ 1 file changed, 1 insertion(+)
+
+diff --git a/src/fips.c b/src/fips.c
+index 6599121c..272aabae 100644
+--- a/src/fips.c
++++ b/src/fips.c
+@@ -367,6 +367,7 @@ _gcry_fips_indicator_cipher (va_list arg_ptr)
+         case GCRY_CIPHER_MODE_CCM:
+         case GCRY_CIPHER_MODE_GCM:
+         case GCRY_CIPHER_MODE_XTS:
++        case GCRY_CIPHER_MODE_AESWRAP:
+           return GPG_ERR_NO_ERROR;
+         default:
+           return GPG_ERR_NOT_SUPPORTED;
+--
+ 
+commit d6117b04e0e4d5d68df8fb731f618b0d5126ee14
+Author: Jakub Jelen <jjelen@redhat.com>
+Date:   Tue Jan 17 14:39:34 2023 +0100
+
+    fips: Remove GCM mode from the allowed FIPS indicators
+    
+    * src/fips.c (_gcry_fips_indicator_cipher): Do not mark GCM mode as FIPS
+      approved.
+    ---
+    
+    Signed-off-by: Jakub Jelen <jjelen@redhat.com>
+
+diff --git a/src/fips.c b/src/fips.c
+index 272aabae..774e7b4c 100644
+--- a/src/fips.c
++++ b/src/fips.c
+@@ -365,7 +365,6 @@ _gcry_fips_indicator_cipher (va_list arg_ptr)
+         case GCRY_CIPHER_MODE_OFB:
+         case GCRY_CIPHER_MODE_CTR:
+         case GCRY_CIPHER_MODE_CCM:
+-        case GCRY_CIPHER_MODE_GCM:
+         case GCRY_CIPHER_MODE_XTS:
+         case GCRY_CIPHER_MODE_AESWRAP:
+           return GPG_ERR_NO_ERROR;
+--

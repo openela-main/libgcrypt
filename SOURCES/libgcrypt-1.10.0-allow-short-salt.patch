@@ -1,0 +1,77 @@
+From 58c92098d053aae7c78cc42bdd7c80c13efc89bb Mon Sep 17 00:00:00 2001
+From: NIIBE Yutaka <gniibe@fsij.org>
+Date: Fri, 24 Jun 2022 08:59:31 +0900
+Subject: [PATCH] hmac,hkdf: Allow use of shorter salt for HKDF.
+
+* cipher/md.c (prepare_macpads): Move the check to...
+* src/visibility.c (gcry_mac_setkey): ... here.
+* tests/t-kdf.c (check_hkdf): No failure is expected.
+
+--
+
+GnuPG-bug-id: 6039
+Fixes-commit: 76aad97dd312e83f2f9b8d086553f2b72ab6546f
+Signed-off-by: NIIBE Yutaka <gniibe@fsij.org>
+---
+ cipher/md.c      |  3 ---
+ src/visibility.c |  3 +++
+ tests/t-kdf.c    | 12 +-----------
+ 3 files changed, 4 insertions(+), 14 deletions(-)
+
+diff --git a/cipher/md.c b/cipher/md.c
+index 4f4fc9bf..34336b5c 100644
+--- a/cipher/md.c
++++ b/cipher/md.c
+@@ -903,9 +903,6 @@ prepare_macpads (gcry_md_hd_t a, const unsigned char *key, size_t keylen)
+ {
+   GcryDigestEntry *r;
+ 
+-  if (fips_mode () && keylen < 14)
+-    return GPG_ERR_INV_VALUE;
+-
+   if (!a->ctx->list)
+     return GPG_ERR_DIGEST_ALGO; /* Might happen if no algo is enabled.  */
+ 
+diff --git a/src/visibility.c b/src/visibility.c
+index c98247d8..aee5bffb 100644
+--- a/src/visibility.c
++++ b/src/visibility.c
+@@ -946,6 +946,9 @@ gcry_mac_setkey (gcry_mac_hd_t hd, const void *key, size_t keylen)
+   if (!fips_is_operational ())
+     return gpg_error (fips_not_operational ());
+ 
++  if (fips_mode () && keylen < 14)
++    return GPG_ERR_INV_VALUE;
++
+   return gpg_error (_gcry_mac_setkey (hd, key, keylen));
+ }
+ 
+-- 
+2.37.1
+commit 02718ade6ab5eee38169c2102097166770a2456d
+Author: Jakub Jelen <jjelen@redhat.com>
+Date:   Thu Oct 20 16:33:11 2022 +0200
+
+    visiblity: Check the HMAC key length in FIPS mode
+    
+    ---
+    * src/visibility.c (gcry_md_setkey): Check the HMAC key length in FIPS
+      mode also in the md_ API.
+    
+    Signed-off-by: Jakub Jelen <jjelen@redhat.com>
+
+diff --git a/src/visibility.c b/src/visibility.c
+index 150b197d..73db3dea 100644
+--- a/src/visibility.c
++++ b/src/visibility.c
+@@ -1357,6 +1357,10 @@ gcry_md_setkey (gcry_md_hd_t hd, const void *key, size_t keylen)
+ {
+   if (!fips_is_operational ())
+     return gpg_error (fips_not_operational ());
++
++  if (fips_mode () && keylen < 14)
++    return GPG_ERR_INV_VALUE;
++
+   return gpg_error (_gcry_md_setkey (hd, key, keylen));
+ }
+ 

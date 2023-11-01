@@ -1,0 +1,277 @@
+From 0c0268177666f6ce53c0a61e86c1c5bd2c53c0b0 Mon Sep 17 00:00:00 2001
+From: Jakub Jelen <jjelen@redhat.com>
+Date: Mon, 6 Mar 2023 15:57:40 +0100
+Subject: [PATCH] fips: Explicitly allow only some PK flags
+
+* src/fips.c (_gcry_fips_indicator_pk_flags): New function for explicit
+  FIPS indicator for public key algorithm flags
+* src/g10lib.h (_gcry_fips_indicator_pk_flags): New.
+* src/gcrypt.h.in (GCRYCTL_FIPS_SERVICE_INDICATOR_PK_FLAGS): New.
+* src/global.c (_gcry_vcontrol): Handle the new option.
+* doc/gcrypt.texi: Document new options.
+--
+
+Signed-off-by: Jakub Jelen <jjelen@redhat.com>
+---
+ doc/gcrypt.texi |  6 ++++++
+ src/fips.c      | 15 +++++++++++++++
+ src/g10lib.h    |  1 +
+ src/gcrypt.h.in |  3 ++-
+ src/global.c    |  7 +++++++
+ 5 files changed, 31 insertions(+), 1 deletion(-)
+
+diff --git a/doc/gcrypt.texi b/doc/gcrypt.texi
+index 462c5931..750b6718 100644
+--- a/doc/gcrypt.texi
++++ b/doc/gcrypt.texi
+@@ -1005,6 +1005,12 @@ Check if the given message digest algorithm is approved under the current
+ FIPS 140-3 certification. If the algorithm is approved, this function returns
+ @code{GPG_ERR_NO_ERROR}. Otherwise @code{GPG_ERR_NOT_SUPPORTED} is returned.
+ 
++@item GCRYCTL_FIPS_SERVICE_INDICATOR_PK_FLAGS; Arguments: const char *
++
++Check if the given public key operation flag is approved under the current
++FIPS 140-3 certification. If the flag is approved, this function returns
++@code{GPG_ERR_NO_ERROR}. Otherwise @code{GPG_ERR_NOT_SUPPORTED} is returned.
++
+ @end table
+ 
+ @end deftypefun
+diff --git a/src/fips.c b/src/fips.c
+index 974ed833..cb547aa2 100644
+--- a/src/fips.c
++++ b/src/fips.c
+@@ -457,6 +457,21 @@ _gcry_fips_indicator_function (va_list arg_ptr)
+ }
+ 
+ 
++int
++_gcry_fips_indicator_pk_flags (va_list arg_ptr)
++{
++  const char *flag = va_arg (arg_ptr, const char *);
++
++  if (strcmp (flag, "param") == 0 ||
++      strcmp (flag, "raw") == 0 ||
++      strcmp (flag, "no-blinding") == 0 ||
++      strcmp (flag, "pss") == 0)
++    return GPG_ERR_NO_ERROR;
++
++  return GPG_ERR_NOT_SUPPORTED;
++}
++
++
+ /* This is a test on whether the library is in the error or
+    operational state. */
+ int
+diff --git a/src/g10lib.h b/src/g10lib.h
+index 86337eed..acff2d6b 100644
+--- a/src/g10lib.h
++++ b/src/g10lib.h
+@@ -471,6 +471,7 @@ int _gcry_fips_indicator_mac (va_list arg_ptr);
+ int _gcry_fips_indicator_md (va_list arg_ptr);
+ int _gcry_fips_indicator_kdf (va_list arg_ptr);
+ int _gcry_fips_indicator_function (va_list arg_ptr);
++int _gcry_fips_indicator_pk_flags (va_list arg_ptr);
+ 
+ int _gcry_fips_is_operational (void);
+ 
+diff --git a/src/gcrypt.h.in b/src/gcrypt.h.in
+index 54080d46..121a2061 100644
+--- a/src/gcrypt.h.in
++++ b/src/gcrypt.h.in
+@@ -332,7 +332,8 @@ enum gcry_ctl_cmds
+     GCRYCTL_NO_FIPS_MODE = 83,
+     GCRYCTL_FIPS_SERVICE_INDICATOR_FUNCTION = 84,
+     GCRYCTL_FIPS_SERVICE_INDICATOR_MAC = 85,
+-    GCRYCTL_FIPS_SERVICE_INDICATOR_MD = 86
++    GCRYCTL_FIPS_SERVICE_INDICATOR_MD = 86,
++    GCRYCTL_FIPS_SERVICE_INDICATOR_PK_FLAGS = 87
+   };
+ 
+ /* Perform various operations defined by CMD. */
+diff --git a/src/global.c b/src/global.c
+index d16d3709..f39df422 100644
+--- a/src/global.c
++++ b/src/global.c
+@@ -818,6 +818,13 @@ _gcry_vcontrol (enum gcry_ctl_cmds cmd, va_list arg_ptr)
+       rc = _gcry_fips_indicator_function (arg_ptr);
+       break;
+ 
++    case GCRYCTL_FIPS_SERVICE_INDICATOR_PK_FLAGS:
++      /* Get FIPS Service Indicator for a public key operation flags.
++       * Returns GPG_ERR_NO_ERROR if the flag is allowed to be used or
++       * GPG_ERR_NOT_SUPPORTED otherwise */
++      rc = _gcry_fips_indicator_pk_flags (arg_ptr);
++      break;
++
+     case PRIV_CTL_INIT_EXTRNG_TEST:  /* Init external random test.  */
+       rc = GPG_ERR_NOT_SUPPORTED;
+       break;
+-- 
+2.39.2
+
+From 22a40df4c0210a671b331932a434f70b50354873 Mon Sep 17 00:00:00 2001
+From: Jakub Jelen <jjelen@redhat.com>
+Date: Mon, 6 Mar 2023 16:05:07 +0100
+Subject: [PATCH] fips: Explicitly disable overriding random in FIPS mode
+
+* src/fips.c: (_gcry_fips_indicator_function): Mark using random
+  override non-approved in FIPS mode.
+--
+
+Signed-off-by: Jakub Jelen <jjelen@redhat.com>
+---
+ src/fips.c | 3 ++-
+ 1 file changed, 2 insertions(+), 1 deletion(-)
+
+diff --git a/src/fips.c b/src/fips.c
+index cb547aa2..a7342030 100644
+--- a/src/fips.c
++++ b/src/fips.c
+@@ -450,7 +450,8 @@ _gcry_fips_indicator_function (va_list arg_ptr)
+   if (strcmp (function, "gcry_pk_sign") == 0 ||
+       strcmp (function, "gcry_pk_verify") == 0 ||
+       strcmp (function, "gcry_pk_encrypt") == 0 ||
+-      strcmp (function, "gcry_pk_decrypt") == 0)
++      strcmp (function, "gcry_pk_decrypt") == 0 ||
++      strcmp (function, "gcry_pk_random_override_new") == 0)
+     return GPG_ERR_NOT_SUPPORTED;
+ 
+   return GPG_ERR_NO_ERROR;
+-- 
+2.39.2
+
+From 1c916b8c99ea0e30f1d81d606fd63b0c45657186 Mon Sep 17 00:00:00 2001
+From: NIIBE Yutaka <gniibe@fsij.org>
+Date: Fri, 24 Mar 2023 13:12:56 +0900
+Subject: [PATCH] fips: More elaborate way of getting FIPS pk flags indicators.
+
+* src/fips.c (_gcry_fips_indicator_pk_flags): List more allowed string
+in the S-expression.
+* doc/gcrypt.texi: Add document for the FIPS service indicator
+GCRYCTL_FIPS_SERVICE_INDICATOR_PK_FLAGS with example.
+
+--
+
+GnuPG-bug-id: 6417
+Signed-off-by: Jakub Jelen <jjelen@redhat.com>
+Signed-off-by: NIIBE Yutaka <gniibe@fsij.org>
+---
+ doc/gcrypt.texi | 42 +++++++++++++++++++++++++++++++++++++++---
+ src/fips.c      | 41 +++++++++++++++++++++++++++++++++++++----
+ 2 files changed, 76 insertions(+), 7 deletions(-)
+
+diff --git a/doc/gcrypt.texi b/doc/gcrypt.texi
+index 750b6718..752f64d6 100644
+--- a/doc/gcrypt.texi
++++ b/doc/gcrypt.texi
+@@ -1007,9 +1007,45 @@ FIPS 140-3 certification. If the algorithm is approved, this function returns
+ 
+ @item GCRYCTL_FIPS_SERVICE_INDICATOR_PK_FLAGS; Arguments: const char *
+ 
+-Check if the given public key operation flag is approved under the current
+-FIPS 140-3 certification. If the flag is approved, this function returns
+-@code{GPG_ERR_NO_ERROR}. Otherwise @code{GPG_ERR_NOT_SUPPORTED} is returned.
++Check if the given public key operation flag or s-expression object name is
++approved under the current FIPS 140-3 certification.  If the flag is
++approved, this function returns @code{GPG_ERR_NO_ERROR}.
++
++Otherwise @code{GPG_ERR_NOT_SUPPORTED} is returned.
++
++For compound s-expression objects, if the object name is allowed, the user
++is responsible to check also the internal members.  For example:
++
++@example
++  gcry_sexp_t s_sig = NULL;
++  gcry_md_hd_t hd = NULL;
++  gcry_sexp_t s_sk = NULL;
++  const char *data_tmpl = "(data(flags pss)(hash %s %b)(salt-length 1:0))";
++
++  if (err = gcry_control(GCRYCTL_FIPS_SERVICE_INDICATOR_FUNCTION, "gcry_md_open") &&
++      err = gcry_control(GCRYCTL_FIPS_SERVICE_INDICATOR_MD, GCRY_MD_SHA512) &&
++      err = gcry_md_open (&hd, GCRY_MD_SHA512, 0))
++    @{
++      printf ("gcry_md_open failed: %s", gpg_strerror (err));
++      return;
++    @}
++  gcry_md_write (hd, buffer, buflen);
++
++  /* initialize the key in s_sk */
++
++  if (err = gcry_control(GCRYCTL_FIPS_SERVICE_INDICATOR_FUNCTION, "gcry_pk_hash_sign") &&
++      err = gcry_control(GCRYCTL_FIPS_SERVICE_INDICATOR_PK_FLAGS, "data") &&
++      err = gcry_control(GCRYCTL_FIPS_SERVICE_INDICATOR_PK_FLAGS, "flags") &&
++      err = gcry_control(GCRYCTL_FIPS_SERVICE_INDICATOR_PK_FLAGS, "pss") &&
++      err = gcry_control(GCRYCTL_FIPS_SERVICE_INDICATOR_PK_FLAGS, "hash") &&
++      err = gcry_control(GCRYCTL_FIPS_SERVICE_INDICATOR_PK_FLAGS, "salt-length")
++      err = gcry_pk_hash_sign (&s_sig, data_tmpl, s_sk, hd, NULL))
++    @{
++      printf ("gcry_pk_hash_sign failed: %s", gpg_strerror (err));
++      return;
++    @}
++  /* ok */
++@end example
+ 
+ @end table
+ 
+diff --git a/src/fips.c b/src/fips.c
+index a7342030..669cfd0e 100644
+--- a/src/fips.c
++++ b/src/fips.c
+@@ -457,16 +457,49 @@ _gcry_fips_indicator_function (va_list arg_ptr)
+   return GPG_ERR_NO_ERROR;
+ }
+ 
++/* Note: the array should be sorted.  */
++static const char *valid_string_in_sexp[] = {
++  "curve",
++  "d",
++  "data",
++  "e",
++  "ecdsa",
++  "flags",
++  "genkey",
++  "hash",
++  "n",
++  "nbits",
++  "pkcs1",
++  "private-key",
++  "pss",
++  "public-key",
++  "q",
++  "r",
++  "raw",
++  "rsa",
++  "rsa-use-e",
++  "s",
++  "salt-length",
++  "sig-val",
++  "value"
++};
++
++static int
++compare_string (const void *v1, const void *v2)
++{
++  const char * const *p_str1 = v1;
++  const char * const *p_str2 = v2;
++
++  return strcmp (*p_str1, *p_str2);
++}
+ 
+ int
+ _gcry_fips_indicator_pk_flags (va_list arg_ptr)
+ {
+   const char *flag = va_arg (arg_ptr, const char *);
+ 
+-  if (strcmp (flag, "param") == 0 ||
+-      strcmp (flag, "raw") == 0 ||
+-      strcmp (flag, "no-blinding") == 0 ||
+-      strcmp (flag, "pss") == 0)
++  if (bsearch (&flag, valid_string_in_sexp, DIM (valid_string_in_sexp),
++               sizeof (char *), compare_string))
+     return GPG_ERR_NO_ERROR;
+ 
+   return GPG_ERR_NOT_SUPPORTED;
+-- 
+2.39.2
+

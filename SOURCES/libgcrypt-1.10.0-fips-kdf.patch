@@ -1,0 +1,187 @@
+From 3c04b692de1e7b45b764ff8d66bf84609b012e3a Mon Sep 17 00:00:00 2001
+From: Tobias Heider <tobias.heider@canonical.com>
+Date: Tue, 27 Sep 2022 13:31:05 +0900
+Subject: [PATCH] kdf:pkdf2: Check minimum allowed key size when running in
+ FIPS mode.
+
+* cipher/kdf.c (_gcry_kdf_pkdf2): Add output length check.
+
+--
+
+GnuPG-bug-id: 6219
+---
+ cipher/kdf.c | 4 ++++
+ 1 file changed, 4 insertions(+)
+
+diff --git a/cipher/kdf.c b/cipher/kdf.c
+index 81523320..67c60df8 100644
+--- a/cipher/kdf.c
++++ b/cipher/kdf.c
+@@ -160,6 +160,10 @@ _gcry_kdf_pkdf2 (const void *passphrase, size_t passphraselen,
+     return GPG_ERR_INV_VALUE;
+ #endif
+ 
++  /* Check minimum key size */
++  if (fips_mode () && dklen < 14)
++    return GPG_ERR_INV_VALUE;
++
+ 
+   /* Step 2 */
+   l = ((dklen - 1)/ hlen) + 1;
+-- 
+2.37.3
+From e5a5e847b66eb6b80e60a2dffa347268f059aee3 Mon Sep 17 00:00:00 2001
+From: Jakub Jelen <jjelen@redhat.com>
+Date: Tue, 4 Oct 2022 12:44:54 +0200
+Subject: [PATCH] tests: Reproducer for short dklen in FIPS mode
+
+* tests/t-kdf.c (check_pbkdf2): Add test vector with short dklen and
+  verify it fails in FIPS mode
+--
+
+GnuPG-bug-id: 6219
+Signed-off-by: Jakub Jelen <jjelen@redhat.com>
+---
+ tests/t-kdf.c | 12 ++++++++++--
+ 1 file changed, 10 insertions(+), 2 deletions(-)
+
+diff --git a/tests/t-kdf.c b/tests/t-kdf.c
+index c0192d7b..716fb53e 100644
+--- a/tests/t-kdf.c
++++ b/tests/t-kdf.c
+@@ -909,6 +909,14 @@ check_pbkdf2 (void)
+       "\x0c\x60\xc8\x0f\x96\x1f\x0e\x71\xf3\xa9"
+       "\xb5\x24\xaf\x60\x12\x06\x2f\xe0\x37\xa6"
+     },
++    {
++      "password", 8,
++      "salt", 4,
++      GCRY_MD_SHA1,
++      1,
++      10, /* too short dklen for FIPS */
++      "\x0c\x60\xc8\x0f\x96\x1f\x0e\x71\xf3\xa9"
++    },
+     {
+       "password", 8,
+       "salt", 4,
+@@ -1109,7 +1117,7 @@ check_pbkdf2 (void)
+                              GCRY_KDF_PBKDF2, tv[tvidx].hashalgo,
+                              tv[tvidx].salt, tv[tvidx].saltlen,
+                              tv[tvidx].c, tv[tvidx].dklen, outbuf);
+-      if (in_fips_mode && tvidx > 6)
++      if (in_fips_mode && tvidx > 7)
+         {
+           if (!err)
+             fail ("pbkdf2 test %d unexpectedly passed in FIPS mode: %s\n",
+@@ -1118,7 +1126,7 @@ check_pbkdf2 (void)
+         }
+       if (err)
+         {
+-          if (in_fips_mode && tv[tvidx].plen < 14)
++          if (in_fips_mode && (tv[tvidx].plen < 14 || tv[tvidx].dklen < 14))
+             {
+               if (verbose)
+                 fprintf (stderr,
+-- 
+2.37.3
+
+From f4a861f3e5ae82f278284061e4829c03edf9c3a7 Mon Sep 17 00:00:00 2001
+From: Jakub Jelen <jjelen@redhat.com>
+Date: Fri, 18 Nov 2022 09:49:50 +0900
+Subject: [PATCH] pkdf2: Add checks for FIPS.
+
+* cipher/kdf.c (_gcry_kdf_pkdf2): Require 8 chars passphrase for FIPS.
+Set bounds for salt length and iteration count in FIPS mode.
+
+--
+
+GnuPG-bug-id: 6039
+Signed-off-by: Jakub Jelen <jjelen@redhat.com>
+---
+ cipher/kdf.c | 12 ++++++++++++
+ 1 file changed, 12 insertions(+)
+
+diff --git a/cipher/kdf.c b/cipher/kdf.c
+index d22584da..823c744e 100644
+--- a/cipher/kdf.c
++++ b/cipher/kdf.c
+@@ -160,6 +160,18 @@ _gcry_kdf_pkdf2 (const void *passphrase, size_t passphraselen,
+     return GPG_ERR_INV_VALUE;
+ #endif
+ 
++  /* FIPS requires minimum passphrase length, see FIPS 140-3 IG D.N */
++  if (fips_mode () && passphraselen < 8)
++    return GPG_ERR_INV_VALUE;
++
++  /* FIPS requires minimum salt length of 128 b (SP 800-132 sec. 5.1, p.6) */
++  if (fips_mode () && saltlen < 16)
++    return GPG_ERR_INV_VALUE;
++
++  /* FIPS requires minimum iterations bound (SP 800-132 sec 5.2, p.6) */
++  if (fips_mode () && iterations < 1000)
++    return GPG_ERR_INV_VALUE;
++
+   /* Check minimum key size */
+   if (fips_mode () && dklen < 14)
+     return GPG_ERR_INV_VALUE;
+-- 
+2.39.0
+
+From f5fe94810f3099c9ccc2ca3a5891502922ab0576 Mon Sep 17 00:00:00 2001
+From: Jakub Jelen <jjelen@redhat.com>
+Date: Tue, 28 Feb 2023 12:53:28 +0100
+Subject: [PATCH] kdf: Update tests in regards to the allowed parameters in
+ FIPS mode.
+
+* cipher/kdf.c (check_one): run selftests for more approved parameters
+and check that wrong parameters correctly fail in FIPS mode.
+
+--
+
+Fixes-commit: 535a4d345872aa2cd2ab3a5f9c4411d0a0313328
+GnuPG-bug-id: 5512
+Signed-off-by: Jakub Jelen <jjelen@redhat.com>
+---
+ cipher/kdf.c | 22 +++++++++++++++-------
+ 1 file changed, 15 insertions(+), 7 deletions(-)
+
+diff --git a/cipher/kdf.c b/cipher/kdf.c
+index 823c744e..12beec56 100644
+--- a/cipher/kdf.c
++++ b/cipher/kdf.c
+@@ -2059,17 +2059,25 @@ check_one (int algo, int hash_algo,
+ {
+   unsigned char key[512]; /* hardcoded to avoid allocation */
+   size_t keysize = expectlen;
+-
+-  /* Skip test with shoter passphrase in FIPS mode.  */
+-  if (fips_mode () && passphraselen < 14)
+-    return NULL;
++  int rv;
+ 
+   if (keysize > sizeof(key))
+     return "invalid tests data";
+ 
+-  if (_gcry_kdf_derive (passphrase, passphraselen, algo,
+-                        hash_algo, salt, saltlen, iterations,
+-                        keysize, key))
++  rv = _gcry_kdf_derive (passphrase, passphraselen, algo,
++                         hash_algo, salt, saltlen, iterations,
++                         keysize, key);
++  /* In fips mode we have special requirements for the input and
++   * output parameters */
++  if (fips_mode ())
++    {
++      if (rv && (passphraselen < 8 || saltlen < 16 ||
++                 iterations < 1000 || expectlen < 14))
++        return NULL;
++      else if (rv)
++        return "gcry_kdf_derive unexpectedly failed in FIPS Mode";
++    }
++  else if (rv)
+     return "gcry_kdf_derive failed";
+ 
+   if (memcmp (key, expect, expectlen))
+-- 
+2.39.2
+

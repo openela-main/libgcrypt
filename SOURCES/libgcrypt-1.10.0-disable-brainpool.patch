@@ -1,0 +1,239 @@
+From d651e25be0bc0c11f4d3d7c72be8cfbbe82b3874 Mon Sep 17 00:00:00 2001
+From: Jakub Jelen <jjelen@redhat.com>
+Date: Fri, 10 Sep 2021 18:39:00 +0200
+Subject: [PATCH] Allow building libgcrypt without Brainpool curves
+
+* README: Document possibility to build without brainpool curves
+* cipher/ecc-curves.c: Conditionalize brainpool curves definitions
+* configure.ac: Implement possibility to build without brainpool curves
+* tests/curves.c: Skip brainpool curves if they are not built-in
+* tests/keygrip.c: Skip brainpool curves if they are not built-in
+
+--
+
+Signed-off-by: Jakub Jelen <jjelen@redhat.com>
+---
+ README              |  3 +++
+ cipher/ecc-curves.c |  4 ++++
+ configure.ac        | 13 +++++++++++++
+ tests/curves.c      | 46 ++++++++++++++++++++++++++++++---------------
+ tests/keygrip.c     |  2 ++
+ 5 files changed, 53 insertions(+), 15 deletions(-)
+
+diff --git a/README b/README
+index 436b6cd4..1044109c 100644
+--- a/README
++++ b/README
+@@ -127,6 +127,9 @@
+                      the list used with the current build the program
+                      tests/version may be used.
+ 
++     --disable-brainpool
++                     Do not build in support for Brainpool curves.
++
+      --disable-endian-check
+                      Don't let configure test for the endianness but
+                      try to use the OS provided macros at compile
+diff --git a/cipher/ecc-curves.c b/cipher/ecc-curves.c
+index 7c86e12c..8fd95a9c 100644
+--- a/cipher/ecc-curves.c
++++ b/cipher/ecc-curves.c
+@@ -77,6 +77,7 @@ static const struct
+     { "NIST P-521", "1.3.132.0.35" },
+     { "NIST P-521", "nistp521"   },          /* rfc5656.  */
+ 
++#ifdef ENABLE_BRAINPOOL
+     { "brainpoolP160r1", "1.3.36.3.3.2.8.1.1.1" },
+     { "brainpoolP192r1", "1.3.36.3.3.2.8.1.1.3" },
+     { "brainpoolP224r1", "1.3.36.3.3.2.8.1.1.5" },
+@@ -84,6 +85,7 @@ static const struct
+     { "brainpoolP320r1", "1.3.36.3.3.2.8.1.1.9" },
+     { "brainpoolP384r1", "1.3.36.3.3.2.8.1.1.11"},
+     { "brainpoolP512r1", "1.3.36.3.3.2.8.1.1.13"},
++#endif /* ENABLE_BRAINPOOL */
+ 
+     { "GOST2001-test", "1.2.643.2.2.35.0" },
+     { "GOST2001-CryptoPro-A", "1.2.643.2.2.35.1" },
+@@ -297,6 +299,7 @@ static const ecc_domain_parms_t domain_parms[] =
+       1
+     },
+ 
++#ifdef ENABLE_BRAINPOOL
+     { "brainpoolP160r1", 160, 0,
+       MPI_EC_WEIERSTRASS, ECC_DIALECT_STANDARD,
+       "0xe95e4a5f737059dc60dfc7ad95b3d8139515620f",
+@@ -391,6 +394,7 @@ static const ecc_domain_parms_t domain_parms[] =
+       "b2dcde494a5f485e5bca4bd88a2763aed1ca2b2fa8f0540678cd1e0f3ad80892",
+       1
+     },
++#endif /* ENABLE_BRAINPOOL */
+     {
+       "GOST2001-test", 256, 0,
+       MPI_EC_WEIERSTRASS, ECC_DIALECT_STANDARD,
+diff --git a/configure.ac b/configure.ac
+index 6efbf139..f4ac1887 100644
+--- a/configure.ac
++++ b/configure.ac
+@@ -614,6 +614,14 @@ AC_ARG_WITH(fips-module-version,
+ AC_DEFINE_UNQUOTED(FIPS_MODULE_VERSION, "$fips_module_version",
+                    [Define FIPS module version for certification])
+ 
++# Implementation of the --disable-brainpool switch.
++AC_MSG_CHECKING([whether we want to disable the use of brainpool curves])
++AC_ARG_ENABLE(brainpool,
++              AS_HELP_STRING([--disable-brainpool],
++                             [Disable the brainpool curves]),
++              use_brainpool="$enableval",use_brainpool=yes)
++AC_MSG_RESULT($use_brainpool)
++
+ # Implementation of the --disable-jent-support switch.
+ AC_MSG_CHECKING([whether jitter entropy support is requested])
+ AC_ARG_ENABLE(jent-support,
+@@ -2466,6 +2474,10 @@ if test x"$ppccryptosupport" = xyes ; then
+   AC_DEFINE(ENABLE_PPC_CRYPTO_SUPPORT,1,
+             [Enable support for POWER 8 (PowerISA 2.07) crypto extension.])
+ fi
++if test x"$use_brainpool" = xyes ; then
++  AC_DEFINE(ENABLE_BRAINPOOL, 1,
++            [Enable support for the brainpool curves.])
++fi
+ if test x"$jentsupport" = xyes ; then
+   AC_DEFINE(ENABLE_JENT_SUPPORT, 1,
+             [Enable support for the jitter entropy collector.])
+@@ -3296,6 +3308,7 @@ GCRY_MSG_WRAP([Enabled digest algorithms:],[$enabled_digests])
+ GCRY_MSG_WRAP([Enabled kdf algorithms:   ],[$enabled_kdfs])
+ GCRY_MSG_WRAP([Enabled pubkey algorithms:],[$enabled_pubkey_ciphers])
+ GCRY_MSG_SHOW([Random number generator:  ],[$random])
++GCRY_MSG_SHOW([Enabled Brainpool curves: ],[$use_brainpool])
+ GCRY_MSG_SHOW([Try using jitter entropy: ],[$jentsupport])
+ GCRY_MSG_SHOW([Using linux capabilities: ],[$use_capabilities])
+ GCRY_MSG_SHOW([FIPS module version:      ],[$fips_module_version])
+diff --git a/tests/curves.c b/tests/curves.c
+index 3c738171..8eb79565 100644
+--- a/tests/curves.c
++++ b/tests/curves.c
+@@ -33,7 +33,11 @@
+ #include "t-common.h"
+ 
+ /* Number of curves defined in ../cipher/ecc-curves.c */
+-#define N_CURVES 27
++#ifdef ENABLE_BRAINPOOL
++# define N_CURVES 27
++#else
++# define N_CURVES 20
++#endif
+ 
+ /* A real world sample public key.  */
+ static char const sample_key_1[] =
+@@ -52,6 +56,7 @@ static char const sample_key_1[] =
+ static char const sample_key_1_curve[] = "NIST P-256";
+ static unsigned int sample_key_1_nbits = 256;
+ 
++#ifdef ENABLE_BRAINPOOL
+ /* A made up sample public key.  */
+ static char const sample_key_2[] =
+ "(public-key\n"
+@@ -68,6 +73,7 @@ static char const sample_key_2[] =
+ "  ))";
+ static char const sample_key_2_curve[] = "brainpoolP160r1";
+ static unsigned int sample_key_2_nbits = 160;
++#endif /* ENABLE_BRAINPOOL */
+ 
+ static int in_fips_mode;
+ 
+@@ -113,6 +119,7 @@ check_matching (void)
+ 
+   gcry_sexp_release (key);
+ 
++#ifdef ENABLE_BRAINPOOL
+   if (!in_fips_mode)
+     {
+       err = gcry_sexp_new (&key, sample_key_2, 0, 1);
+@@ -130,6 +137,7 @@ check_matching (void)
+ 
+       gcry_sexp_release (key);
+     }
++#endif /* ENABLE_BRAINPOOL */
+ }
+ 
+ #define TEST_ERROR_EXPECTED (1 << 0)
+@@ -185,20 +193,26 @@ check_get_params (void)
+        { GCRY_PK_ECC, "1.3.132.0.35" },
+        { GCRY_PK_ECC, "nistp521"   },
+ 
+-       { GCRY_PK_ECC, "brainpoolP160r1",       TEST_NOFIPS },
+-       { GCRY_PK_ECC, "1.3.36.3.3.2.8.1.1.1",  TEST_NOFIPS },
+-       { GCRY_PK_ECC, "brainpoolP192r1",       TEST_NOFIPS },
+-       { GCRY_PK_ECC, "1.3.36.3.3.2.8.1.1.3",  TEST_NOFIPS },
+-       { GCRY_PK_ECC, "brainpoolP224r1",       TEST_NOFIPS },
+-       { GCRY_PK_ECC, "1.3.36.3.3.2.8.1.1.5",  TEST_NOFIPS },
+-       { GCRY_PK_ECC, "brainpoolP256r1",       TEST_NOFIPS },
+-       { GCRY_PK_ECC, "1.3.36.3.3.2.8.1.1.7",  TEST_NOFIPS },
+-       { GCRY_PK_ECC, "brainpoolP320r1",       TEST_NOFIPS },
+-       { GCRY_PK_ECC, "1.3.36.3.3.2.8.1.1.9",  TEST_NOFIPS },
+-       { GCRY_PK_ECC, "brainpoolP384r1",       TEST_NOFIPS },
+-       { GCRY_PK_ECC, "1.3.36.3.3.2.8.1.1.11", TEST_NOFIPS },
+-       { GCRY_PK_ECC, "brainpoolP512r1",       TEST_NOFIPS },
+-       { GCRY_PK_ECC, "1.3.36.3.3.2.8.1.1.13", TEST_NOFIPS },
++#ifdef ENABLE_BRAINPOOL
++# define BRAINPOOL_FLAGS TEST_NOFIPS
++#else
++# define BRAINPOOL_FLAGS TEST_ERROR_EXPECTED
++#endif /* ENABLE_BRAINPOOL */
++       { GCRY_PK_ECC, "brainpoolP160r1",       BRAINPOOL_FLAGS },
++       { GCRY_PK_ECC, "1.3.36.3.3.2.8.1.1.1",  BRAINPOOL_FLAGS },
++       { GCRY_PK_ECC, "brainpoolP192r1",       BRAINPOOL_FLAGS },
++       { GCRY_PK_ECC, "1.3.36.3.3.2.8.1.1.3",  BRAINPOOL_FLAGS },
++       { GCRY_PK_ECC, "brainpoolP224r1",       BRAINPOOL_FLAGS },
++       { GCRY_PK_ECC, "1.3.36.3.3.2.8.1.1.5",  BRAINPOOL_FLAGS },
++       { GCRY_PK_ECC, "brainpoolP256r1",       BRAINPOOL_FLAGS },
++       { GCRY_PK_ECC, "1.3.36.3.3.2.8.1.1.7",  BRAINPOOL_FLAGS },
++       { GCRY_PK_ECC, "brainpoolP320r1",       BRAINPOOL_FLAGS },
++       { GCRY_PK_ECC, "1.3.36.3.3.2.8.1.1.9",  BRAINPOOL_FLAGS },
++       { GCRY_PK_ECC, "brainpoolP384r1",       BRAINPOOL_FLAGS },
++       { GCRY_PK_ECC, "1.3.36.3.3.2.8.1.1.11", BRAINPOOL_FLAGS },
++       { GCRY_PK_ECC, "brainpoolP512r1",       BRAINPOOL_FLAGS },
++       { GCRY_PK_ECC, "1.3.36.3.3.2.8.1.1.13", BRAINPOOL_FLAGS },
++#undef BRAINPOOL_ERROR_EXPECTED
+ 
+        { GCRY_PK_ECC, "GOST2001-test", TEST_NOFIPS },
+        { GCRY_PK_ECC, "1.2.643.2.2.35.0", TEST_NOFIPS },
+@@ -282,6 +296,7 @@ check_get_params (void)
+ 
+   gcry_sexp_release (param);
+ 
++#ifdef ENABLE_BRAINPOOL
+   if (!in_fips_mode)
+     {
+       param = gcry_pk_get_param (GCRY_PK_ECDSA, sample_key_2_curve);
+@@ -297,6 +312,7 @@ check_get_params (void)
+ 
+       gcry_sexp_release (param);
+     }
++#endif /* ENABLE_BRAINPOOL */
+ 
+   /* Some simple tests */
+   for (idx=0; idx < DIM (tv); idx++)
+diff --git a/tests/keygrip.c b/tests/keygrip.c
+index 49bd71bc..fc4c17be 100644
+--- a/tests/keygrip.c
++++ b/tests/keygrip.c
+@@ -149,6 +149,7 @@ static struct
+       " (q #04C8A4CEC2E9A9BC8E173531A67B0840DF345C32E261ADD780E6D83D56EFADFD5DE872F8B854819B59543CE0B7F822330464FBC4E6324DADDCD9D059554F63B344#)))",
+       "\xE6\xDF\x94\x2D\xBD\x8C\x77\x05\xA3\xDD\x41\x6E\xFC\x04\x01\xDB\x31\x0E\x99\xB6"
+     },
++#ifdef ENABLE_BRAINPOOL
+     {
+       GCRY_PK_ECC,
+       "(public-key"
+@@ -197,6 +198,7 @@ static struct
+       "\xD6\xE1\xBF\x43\xAC\x9B\x9A\x12\xE7\x3F",
+       1
+     },
++#endif /*ENABLE_BRAINPOOL */
+     { /* Ed25519 standard */
+       GCRY_PK_ECC,
+       "(public-key"
+-- 
+2.34.1
+
