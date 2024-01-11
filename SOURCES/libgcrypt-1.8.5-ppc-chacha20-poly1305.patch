@@ -1,0 +1,3521 @@
+From 83e50634789cab5071d648f66622cc1b3cf72318 Mon Sep 17 00:00:00 2001
+From: Eric Richter <erichte@linux.vnet.ibm.com>
+Date: Thu, 24 Jun 2021 18:31:51 -0600
+Subject: [PATCH] improvements for chacha20 and poly1305 on power
+
+---
+ cipher/Makefile.am            |   22 +
+ cipher/chacha20-new.c         | 1344 +++++++++++++++++++++++++++++++++
+ cipher/chacha20-ppc.c         |  646 ++++++++++++++++
+ cipher/chacha20.c             |    7 +
+ cipher/cipher-internal.h      |    9 +-
+ cipher/mpi-new/mpi-asm-defs.h |    8 +
+ cipher/mpi-new/mpi-inline.h   |  161 ++++
+ cipher/mpi-new/mpi-internal.h |  305 ++++++++
+ cipher/poly1305-new.c         |  749 ++++++++++++++++++
+ cipher/poly1305.c             |    7 +
+ configure.ac                  |   24 +
+ mpi/longlong.h                |    2 -
+ 12 files changed, 3281 insertions(+), 3 deletions(-)
+ create mode 100644 cipher/chacha20-new.c
+ create mode 100644 cipher/chacha20-ppc.c
+ create mode 100644 cipher/mpi-new/mpi-asm-defs.h
+ create mode 100644 cipher/mpi-new/mpi-inline.h
+ create mode 100644 cipher/mpi-new/mpi-internal.h
+ create mode 100644 cipher/poly1305-new.c
+
+diff --git a/cipher/Makefile.am b/cipher/Makefile.am
+index 7a777ef2..86ae09fa 100644
+--- a/cipher/Makefile.am
++++ b/cipher/Makefile.am
+@@ -65,6 +65,7 @@ blowfish.c blowfish-amd64.S blowfish-arm.S \
+ cast5.c cast5-amd64.S cast5-arm.S \
+ chacha20.c chacha20-sse2-amd64.S chacha20-ssse3-amd64.S chacha20-avx2-amd64.S \
+   chacha20-armv7-neon.S \
++  chacha20-new.c chacha20-ppc.c \
+ cipher-gcm-ppc.c cipher-gcm-intel-pclmul.c \
+   cipher-gcm-armv8-aarch32-ce.S cipher-gcm-armv8-aarch64-ce.S \
+ crc.c \
+@@ -80,6 +81,7 @@ gostr3411-94.c \
+ md4.c \
+ md5.c \
+ poly1305-sse2-amd64.S poly1305-avx2-amd64.S poly1305-armv7-neon.S \
++  poly1305-new.c \
+ rijndael.c rijndael-internal.h rijndael-tables.h rijndael-aesni.c \
+   rijndael-padlock.c rijndael-amd64.S rijndael-arm.S \
+   rijndael-ssse3-amd64.c rijndael-ssse3-amd64-asm.S \
+@@ -172,3 +174,23 @@ cipher-gcm-ppc.o: $(srcdir)/cipher-gcm-ppc.c Makefile
+ 
+ cipher-gcm-ppc.lo: $(srcdir)/cipher-gcm-ppc.c Makefile
+ 	`echo $(LTCOMPILE) $(ppc_vcrypto_cflags) -c $< `
++
++
++# MAYBE WILL NEED THIS ONE?
++poly1305-new.o: $(srcdir)/poly1305-new.c Makefile
++	`echo $(COMPILE) $(ppc_vcrypto_cflags) -c $< `
++
++poly1305-new.lo: $(srcdir)/poly1305-new.c Makefile
++	`echo $(LTCOMPILE) $(ppc_vcrypto_cflags) -c $< `
++
++chacha20-ppc.o: $(srcdir)/chacha20-ppc.c Makefile
++	`echo $(COMPILE) $(ppc_vcrypto_cflags) -c $< `
++
++chacha20-ppc.lo: $(srcdir)/chacha20-ppc.c Makefile
++	`echo $(LTCOMPILE) $(ppc_vcrypto_cflags) -c $< `
++
++chacha20-new.o: $(srcdir)/chacha20-new.c Makefile
++	`echo $(COMPILE) $(ppc_vcrypto_cflags) -c $< `
++
++chacha20-new.lo: $(srcdir)/chacha20-new.c Makefile
++	`echo $(LTCOMPILE) $(ppc_vcrypto_cflags) -c $< `
+diff --git a/cipher/chacha20-new.c b/cipher/chacha20-new.c
+new file mode 100644
+index 00000000..347d9726
+--- /dev/null
++++ b/cipher/chacha20-new.c
+@@ -0,0 +1,1344 @@
++/* chacha20.c  -  Bernstein's ChaCha20 cipher
++ * Copyright (C) 2014,2017-2019 Jussi Kivilinna <jussi.kivilinna@iki.fi>
++ *
++ * This file is part of Libgcrypt.
++ *
++ * Libgcrypt is free software; you can redistribute it and/or modify
++ * it under the terms of the GNU Lesser general Public License as
++ * published by the Free Software Foundation; either version 2.1 of
++ * the License, or (at your option) any later version.
++ *
++ * Libgcrypt is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++ * GNU Lesser General Public License for more details.
++ *
++ * You should have received a copy of the GNU Lesser General Public
++ * License along with this program; if not, see <http://www.gnu.org/licenses/>.
++ *
++ * For a description of the algorithm, see:
++ *   http://cr.yp.to/chacha.html
++ */
++
++/*
++ * Based on D. J. Bernstein reference implementation at
++ * http://cr.yp.to/chacha.html:
++ *
++ * chacha-regs.c version 20080118
++ * D. J. Bernstein
++ * Public domain.
++ */
++
++#include <config.h>
++
++#if defined(ENABLE_PPC_CRYPTO_SUPPORT) && \
++    defined(HAVE_COMPATIBLE_CC_PPC_ALTIVEC) && \
++    defined(HAVE_GCC_INLINE_ASM_PPC_ALTIVEC) && \
++    defined(USE_CHACHA20) && \
++    __GNUC__ >= 4
++
++#include <stdio.h>
++#include <stdlib.h>
++#include <string.h>
++#include "types.h"
++#include "g10lib.h"
++#include "cipher.h"
++#include "cipher-internal.h"
++#include "bufhelp.h"
++
++
++/* A structure with function pointers for bulk operations.  The cipher
++   algorithm setkey function initializes them when bulk operations are
++   available and the actual encryption routines use them if they are
++   not NULL.  */
++// Stolen from cipher-internal.h
++typedef struct cipher_bulk_ops
++{
++  void (*cfb_enc)(void *context, unsigned char *iv, void *outbuf_arg,
++		  const void *inbuf_arg, size_t nblocks);
++  void (*cfb_dec)(void *context, unsigned char *iv, void *outbuf_arg,
++		  const void *inbuf_arg, size_t nblocks);
++  void (*cbc_enc)(void *context, unsigned char *iv, void *outbuf_arg,
++		  const void *inbuf_arg, size_t nblocks, int cbc_mac);
++  void (*cbc_dec)(void *context, unsigned char *iv, void *outbuf_arg,
++		  const void *inbuf_arg, size_t nblocks);
++  void (*ofb_enc)(void *context, unsigned char *iv, void *outbuf_arg,
++		  const void *inbuf_arg, size_t nblocks);
++  void (*ctr_enc)(void *context, unsigned char *iv, void *outbuf_arg,
++		  const void *inbuf_arg, size_t nblocks);
++  size_t (*ocb_crypt)(gcry_cipher_hd_t c, void *outbuf_arg,
++		      const void *inbuf_arg, size_t nblocks, int encrypt);
++  size_t (*ocb_auth)(gcry_cipher_hd_t c, const void *abuf_arg, size_t nblocks);
++  void (*xts_crypt)(void *context, unsigned char *tweak, void *outbuf_arg,
++		    const void *inbuf_arg, size_t nblocks, int encrypt);
++  size_t (*gcm_crypt)(gcry_cipher_hd_t c, void *outbuf_arg,
++		      const void *inbuf_arg, size_t nblocks, int encrypt);
++} cipher_bulk_ops_t;
++
++
++#define CHACHA20_MIN_KEY_SIZE 16        /* Bytes.  */
++#define CHACHA20_MAX_KEY_SIZE 32        /* Bytes.  */
++#define CHACHA20_BLOCK_SIZE   64        /* Bytes.  */
++#define CHACHA20_MIN_IV_SIZE   8        /* Bytes.  */
++#define CHACHA20_MAX_IV_SIZE  12        /* Bytes.  */
++#define CHACHA20_CTR_SIZE     16        /* Bytes.  */
++
++
++/* USE_SSSE3 indicates whether to compile with Intel SSSE3 code. */
++#undef USE_SSSE3
++#if defined(__x86_64__) && defined(HAVE_GCC_INLINE_ASM_SSSE3) && \
++   (defined(HAVE_COMPATIBLE_GCC_AMD64_PLATFORM_AS) || \
++    defined(HAVE_COMPATIBLE_GCC_WIN64_PLATFORM_AS))
++# define USE_SSSE3 1
++#endif
++
++/* USE_AVX2 indicates whether to compile with Intel AVX2 code. */
++#undef USE_AVX2
++#if defined(__x86_64__) && defined(HAVE_GCC_INLINE_ASM_AVX2) && \
++    (defined(HAVE_COMPATIBLE_GCC_AMD64_PLATFORM_AS) || \
++     defined(HAVE_COMPATIBLE_GCC_WIN64_PLATFORM_AS))
++# define USE_AVX2 1
++#endif
++
++/* USE_ARMV7_NEON indicates whether to enable ARMv7 NEON assembly code. */
++#undef USE_ARMV7_NEON
++#ifdef ENABLE_NEON_SUPPORT
++# if defined(HAVE_ARM_ARCH_V6) && defined(__ARMEL__) \
++     && defined(HAVE_COMPATIBLE_GCC_ARM_PLATFORM_AS) \
++     && defined(HAVE_GCC_INLINE_ASM_NEON)
++#  define USE_ARMV7_NEON 1
++# endif
++#endif
++
++/* USE_AARCH64_SIMD indicates whether to enable ARMv8 SIMD assembly
++ * code. */
++#undef USE_AARCH64_SIMD
++#ifdef ENABLE_NEON_SUPPORT
++# if defined(__AARCH64EL__) \
++       && defined(HAVE_COMPATIBLE_GCC_AARCH64_PLATFORM_AS) \
++       && defined(HAVE_GCC_INLINE_ASM_AARCH64_NEON)
++#  define USE_AARCH64_SIMD 1
++# endif
++#endif
++
++/* USE_PPC_VEC indicates whether to enable PowerPC vector
++ * accelerated code. */
++#undef USE_PPC_VEC
++#ifdef ENABLE_PPC_CRYPTO_SUPPORT
++# if defined(HAVE_COMPATIBLE_CC_PPC_ALTIVEC) && \
++     defined(HAVE_GCC_INLINE_ASM_PPC_ALTIVEC)
++#  if __GNUC__ >= 4
++#   define USE_PPC_VEC 1
++#  endif
++# endif
++#endif
++
++/* USE_S390X_VX indicates whether to enable zSeries code. */
++#undef USE_S390X_VX
++#if defined (__s390x__) && __GNUC__ >= 4 && __ARCH__ >= 9
++# if defined(HAVE_GCC_INLINE_ASM_S390X_VX)
++#  define USE_S390X_VX 1
++# endif /* USE_S390X_VX */
++#endif
++
++/* Assembly implementations use SystemV ABI, ABI conversion and additional
++ * stack to store XMM6-XMM15 needed on Win64. */
++#undef ASM_FUNC_ABI
++#undef ASM_EXTRA_STACK
++#if defined(HAVE_COMPATIBLE_GCC_WIN64_PLATFORM_AS)
++# define ASM_FUNC_ABI __attribute__((sysv_abi))
++#else
++# define ASM_FUNC_ABI
++#endif
++
++
++typedef struct CHACHA20_context_s
++{
++  u32 input[16];
++  unsigned char pad[CHACHA20_BLOCK_SIZE];
++  unsigned int unused; /* bytes in the pad.  */
++  unsigned int use_ssse3:1;
++  unsigned int use_avx2:1;
++  unsigned int use_neon:1;
++  unsigned int use_ppc:1;
++  unsigned int use_s390x:1;
++} CHACHA20_context_t;
++
++
++#ifdef USE_SSSE3
++
++unsigned int _gcry_chacha20_amd64_ssse3_blocks4(u32 *state, byte *dst,
++						const byte *src,
++						size_t nblks) ASM_FUNC_ABI;
++
++unsigned int _gcry_chacha20_amd64_ssse3_blocks1(u32 *state, byte *dst,
++						const byte *src,
++						size_t nblks) ASM_FUNC_ABI;
++
++unsigned int _gcry_chacha20_poly1305_amd64_ssse3_blocks4(
++		u32 *state, byte *dst, const byte *src, size_t nblks,
++		void *poly1305_state, const byte *poly1305_src) ASM_FUNC_ABI;
++
++unsigned int _gcry_chacha20_poly1305_amd64_ssse3_blocks1(
++		u32 *state, byte *dst, const byte *src, size_t nblks,
++		void *poly1305_state, const byte *poly1305_src) ASM_FUNC_ABI;
++
++#endif /* USE_SSSE3 */
++
++#ifdef USE_AVX2
++
++unsigned int _gcry_chacha20_amd64_avx2_blocks8(u32 *state, byte *dst,
++					       const byte *src,
++					       size_t nblks) ASM_FUNC_ABI;
++
++unsigned int _gcry_chacha20_poly1305_amd64_avx2_blocks8(
++		u32 *state, byte *dst, const byte *src, size_t nblks,
++		void *poly1305_state, const byte *poly1305_src) ASM_FUNC_ABI;
++
++#endif /* USE_AVX2 */
++
++#ifdef USE_PPC_VEC
++
++unsigned int _gcry_chacha20_ppc8_blocks4(u32 *state, byte *dst,
++					 const byte *src,
++					 size_t nblks);
++
++unsigned int _gcry_chacha20_ppc8_blocks1(u32 *state, byte *dst,
++					 const byte *src,
++					 size_t nblks);
++
++#undef USE_PPC_VEC_POLY1305
++#if SIZEOF_UNSIGNED_LONG == 8
++#define USE_PPC_VEC_POLY1305 1
++unsigned int _gcry_chacha20_poly1305_ppc8_blocks4(
++		u32 *state, byte *dst, const byte *src, size_t nblks,
++		POLY1305_STATE *st, const byte *poly1305_src);
++#endif /* SIZEOF_UNSIGNED_LONG == 8 */
++
++#endif /* USE_PPC_VEC */
++
++#ifdef USE_S390X_VX
++
++unsigned int _gcry_chacha20_s390x_vx_blocks8(u32 *state, byte *dst,
++					     const byte *src, size_t nblks);
++
++unsigned int _gcry_chacha20_s390x_vx_blocks4_2_1(u32 *state, byte *dst,
++						 const byte *src, size_t nblks);
++
++#undef USE_S390X_VX_POLY1305
++#if SIZEOF_UNSIGNED_LONG == 8
++#define USE_S390X_VX_POLY1305 1
++unsigned int _gcry_chacha20_poly1305_s390x_vx_blocks8(
++		u32 *state, byte *dst, const byte *src, size_t nblks,
++		POLY1305_STATE *st, const byte *poly1305_src);
++
++unsigned int _gcry_chacha20_poly1305_s390x_vx_blocks4_2_1(
++		u32 *state, byte *dst, const byte *src, size_t nblks,
++		POLY1305_STATE *st, const byte *poly1305_src);
++#endif /* SIZEOF_UNSIGNED_LONG == 8 */
++
++#endif /* USE_S390X_VX */
++
++#ifdef USE_ARMV7_NEON
++
++unsigned int _gcry_chacha20_armv7_neon_blocks4(u32 *state, byte *dst,
++					       const byte *src,
++					       size_t nblks);
++
++#endif /* USE_ARMV7_NEON */
++
++#ifdef USE_AARCH64_SIMD
++
++unsigned int _gcry_chacha20_aarch64_blocks4(u32 *state, byte *dst,
++					    const byte *src, size_t nblks);
++
++unsigned int _gcry_chacha20_poly1305_aarch64_blocks4(
++		u32 *state, byte *dst, const byte *src, size_t nblks,
++		void *poly1305_state, const byte *poly1305_src);
++
++#endif /* USE_AARCH64_SIMD */
++
++
++static const char *selftest (void);
++
++
++#define ROTATE(v,c)	(rol(v,c))
++#define XOR(v,w)	((v) ^ (w))
++#define PLUS(v,w)	((u32)((v) + (w)))
++#define PLUSONE(v)	(PLUS((v),1))
++
++#define QUARTERROUND(a,b,c,d) \
++  a = PLUS(a,b); d = ROTATE(XOR(d,a),16); \
++  c = PLUS(c,d); b = ROTATE(XOR(b,c),12); \
++  a = PLUS(a,b); d = ROTATE(XOR(d,a), 8); \
++  c = PLUS(c,d); b = ROTATE(XOR(b,c), 7);
++
++#define BUF_XOR_LE32(dst, src, offset, x) \
++  buf_put_le32((dst) + (offset), buf_get_le32((src) + (offset)) ^ (x))
++
++static unsigned int
++do_chacha20_blocks (u32 *input, byte *dst, const byte *src, size_t nblks)
++{
++  u32 x0, x1, x2, x3, x4, x5, x6, x7, x8, x9, x10, x11, x12, x13, x14, x15;
++  unsigned int i;
++
++  while (nblks)
++    {
++      x0 = input[0];
++      x1 = input[1];
++      x2 = input[2];
++      x3 = input[3];
++      x4 = input[4];
++      x5 = input[5];
++      x6 = input[6];
++      x7 = input[7];
++      x8 = input[8];
++      x9 = input[9];
++      x10 = input[10];
++      x11 = input[11];
++      x12 = input[12];
++      x13 = input[13];
++      x14 = input[14];
++      x15 = input[15];
++
++      for (i = 20; i > 0; i -= 2)
++	{
++	  QUARTERROUND(x0, x4,  x8, x12)
++	  QUARTERROUND(x1, x5,  x9, x13)
++	  QUARTERROUND(x2, x6, x10, x14)
++	  QUARTERROUND(x3, x7, x11, x15)
++	  QUARTERROUND(x0, x5, x10, x15)
++	  QUARTERROUND(x1, x6, x11, x12)
++	  QUARTERROUND(x2, x7,  x8, x13)
++	  QUARTERROUND(x3, x4,  x9, x14)
++	}
++
++      x0 = PLUS(x0, input[0]);
++      x1 = PLUS(x1, input[1]);
++      x2 = PLUS(x2, input[2]);
++      x3 = PLUS(x3, input[3]);
++      x4 = PLUS(x4, input[4]);
++      x5 = PLUS(x5, input[5]);
++      x6 = PLUS(x6, input[6]);
++      x7 = PLUS(x7, input[7]);
++      x8 = PLUS(x8, input[8]);
++      x9 = PLUS(x9, input[9]);
++      x10 = PLUS(x10, input[10]);
++      x11 = PLUS(x11, input[11]);
++      x12 = PLUS(x12, input[12]);
++      x13 = PLUS(x13, input[13]);
++      x14 = PLUS(x14, input[14]);
++      x15 = PLUS(x15, input[15]);
++
++      input[12] = PLUSONE(input[12]);
++      input[13] = PLUS(input[13], !input[12]);
++
++      BUF_XOR_LE32(dst, src, 0, x0);
++      BUF_XOR_LE32(dst, src, 4, x1);
++      BUF_XOR_LE32(dst, src, 8, x2);
++      BUF_XOR_LE32(dst, src, 12, x3);
++      BUF_XOR_LE32(dst, src, 16, x4);
++      BUF_XOR_LE32(dst, src, 20, x5);
++      BUF_XOR_LE32(dst, src, 24, x6);
++      BUF_XOR_LE32(dst, src, 28, x7);
++      BUF_XOR_LE32(dst, src, 32, x8);
++      BUF_XOR_LE32(dst, src, 36, x9);
++      BUF_XOR_LE32(dst, src, 40, x10);
++      BUF_XOR_LE32(dst, src, 44, x11);
++      BUF_XOR_LE32(dst, src, 48, x12);
++      BUF_XOR_LE32(dst, src, 52, x13);
++      BUF_XOR_LE32(dst, src, 56, x14);
++      BUF_XOR_LE32(dst, src, 60, x15);
++
++      src += CHACHA20_BLOCK_SIZE;
++      dst += CHACHA20_BLOCK_SIZE;
++      nblks--;
++    }
++
++  /* burn_stack */
++  return (17 * sizeof(u32) + 6 * sizeof(void *));
++}
++
++
++static unsigned int
++chacha20_blocks (CHACHA20_context_t *ctx, byte *dst, const byte *src,
++		 size_t nblks)
++{
++#ifdef USE_SSSE3
++  if (ctx->use_ssse3)
++    {
++      return _gcry_chacha20_amd64_ssse3_blocks1(ctx->input, dst, src, nblks);
++    }
++#endif
++
++#ifdef USE_PPC_VEC
++  if (ctx->use_ppc)
++    {
++      return _gcry_chacha20_ppc8_blocks1(ctx->input, dst, src, nblks);
++    }
++#endif
++
++#ifdef USE_S390X_VX
++  if (ctx->use_s390x)
++    {
++      return _gcry_chacha20_s390x_vx_blocks4_2_1(ctx->input, dst, src, nblks);
++    }
++#endif
++
++  return do_chacha20_blocks (ctx->input, dst, src, nblks);
++}
++
++
++static void
++chacha20_keysetup (CHACHA20_context_t *ctx, const byte *key,
++                   unsigned int keylen)
++{
++  static const char sigma[16] = "expand 32-byte k";
++  static const char tau[16] = "expand 16-byte k";
++  const char *constants;
++
++  ctx->input[4] = buf_get_le32(key + 0);
++  ctx->input[5] = buf_get_le32(key + 4);
++  ctx->input[6] = buf_get_le32(key + 8);
++  ctx->input[7] = buf_get_le32(key + 12);
++  if (keylen == CHACHA20_MAX_KEY_SIZE) /* 256 bits */
++    {
++      key += 16;
++      constants = sigma;
++    }
++  else /* 128 bits */
++    {
++      constants = tau;
++    }
++  ctx->input[8] = buf_get_le32(key + 0);
++  ctx->input[9] = buf_get_le32(key + 4);
++  ctx->input[10] = buf_get_le32(key + 8);
++  ctx->input[11] = buf_get_le32(key + 12);
++  ctx->input[0] = buf_get_le32(constants + 0);
++  ctx->input[1] = buf_get_le32(constants + 4);
++  ctx->input[2] = buf_get_le32(constants + 8);
++  ctx->input[3] = buf_get_le32(constants + 12);
++}
++
++
++static void
++chacha20_ivsetup (CHACHA20_context_t * ctx, const byte *iv, size_t ivlen)
++{
++  if (ivlen == CHACHA20_CTR_SIZE)
++    {
++      ctx->input[12] = buf_get_le32 (iv + 0);
++      ctx->input[13] = buf_get_le32 (iv + 4);
++      ctx->input[14] = buf_get_le32 (iv + 8);
++      ctx->input[15] = buf_get_le32 (iv + 12);
++    }
++  else if (ivlen == CHACHA20_MAX_IV_SIZE)
++    {
++      ctx->input[12] = 0;
++      ctx->input[13] = buf_get_le32 (iv + 0);
++      ctx->input[14] = buf_get_le32 (iv + 4);
++      ctx->input[15] = buf_get_le32 (iv + 8);
++    }
++  else if (ivlen == CHACHA20_MIN_IV_SIZE)
++    {
++      ctx->input[12] = 0;
++      ctx->input[13] = 0;
++      ctx->input[14] = buf_get_le32 (iv + 0);
++      ctx->input[15] = buf_get_le32 (iv + 4);
++    }
++  else
++    {
++      ctx->input[12] = 0;
++      ctx->input[13] = 0;
++      ctx->input[14] = 0;
++      ctx->input[15] = 0;
++    }
++}
++
++
++static void
++chacha20_setiv (void *context, const byte *iv, size_t ivlen)
++{
++  CHACHA20_context_t *ctx = (CHACHA20_context_t *) context;
++
++  /* draft-nir-cfrg-chacha20-poly1305-02 defines 96-bit and 64-bit nonce. */
++  if (iv && ivlen != CHACHA20_MAX_IV_SIZE && ivlen != CHACHA20_MIN_IV_SIZE
++      && ivlen != CHACHA20_CTR_SIZE)
++    log_info ("WARNING: chacha20_setiv: bad ivlen=%u\n", (u32) ivlen);
++
++  if (iv && (ivlen == CHACHA20_MAX_IV_SIZE || ivlen == CHACHA20_MIN_IV_SIZE
++             || ivlen == CHACHA20_CTR_SIZE))
++    chacha20_ivsetup (ctx, iv, ivlen);
++  else
++    chacha20_ivsetup (ctx, NULL, 0);
++
++  /* Reset the unused pad bytes counter.  */
++  ctx->unused = 0;
++}
++
++
++static gcry_err_code_t
++chacha20_do_setkey (CHACHA20_context_t *ctx,
++                    const byte *key, unsigned int keylen)
++{
++  static int initialized;
++  static const char *selftest_failed;
++  unsigned int features = _gcry_get_hw_features ();
++
++  if (!initialized)
++    {
++      initialized = 1;
++      selftest_failed = selftest ();
++      if (selftest_failed)
++        log_error ("CHACHA20 selftest failed (%s)\n", selftest_failed);
++    }
++  if (selftest_failed)
++    return GPG_ERR_SELFTEST_FAILED;
++
++  if (keylen != CHACHA20_MAX_KEY_SIZE && keylen != CHACHA20_MIN_KEY_SIZE)
++    return GPG_ERR_INV_KEYLEN;
++
++#ifdef USE_SSSE3
++  ctx->use_ssse3 = (features & HWF_INTEL_SSSE3) != 0;
++#endif
++#ifdef USE_AVX2
++  ctx->use_avx2 = (features & HWF_INTEL_AVX2) != 0;
++#endif
++#ifdef USE_ARMV7_NEON
++  ctx->use_neon = (features & HWF_ARM_NEON) != 0;
++#endif
++#ifdef USE_AARCH64_SIMD
++  ctx->use_neon = (features & HWF_ARM_NEON) != 0;
++#endif
++#ifdef USE_PPC_VEC
++  ctx->use_ppc = (features & HWF_PPC_ARCH_2_07) != 0;
++#endif
++#ifdef USE_S390X_VX
++  ctx->use_s390x = (features & HWF_S390X_VX) != 0;
++#endif
++
++  (void)features;
++
++  chacha20_keysetup (ctx, key, keylen);
++
++  /* We default to a zero nonce.  */
++  chacha20_setiv (ctx, NULL, 0);
++
++  return 0;
++}
++
++
++static gcry_err_code_t
++chacha20_setkey (void *context, const byte *key, unsigned int keylen,
++                 cipher_bulk_ops_t *bulk_ops)
++{
++  CHACHA20_context_t *ctx = (CHACHA20_context_t *) context;
++  gcry_err_code_t rc = chacha20_do_setkey (ctx, key, keylen);
++  (void)bulk_ops;
++  _gcry_burn_stack (4 + sizeof (void *) + 4 * sizeof (void *));
++  return rc;
++}
++
++
++static unsigned int
++do_chacha20_encrypt_stream_tail (CHACHA20_context_t *ctx, byte *outbuf,
++				 const byte *inbuf, size_t length)
++{
++  static const unsigned char zero_pad[CHACHA20_BLOCK_SIZE] = { 0, };
++  unsigned int nburn, burn = 0;
++
++#ifdef USE_AVX2
++  if (ctx->use_avx2 && length >= CHACHA20_BLOCK_SIZE * 8)
++    {
++      size_t nblocks = length / CHACHA20_BLOCK_SIZE;
++      nblocks -= nblocks % 8;
++      nburn = _gcry_chacha20_amd64_avx2_blocks8(ctx->input, outbuf, inbuf,
++						nblocks);
++      burn = nburn > burn ? nburn : burn;
++      length -= nblocks * CHACHA20_BLOCK_SIZE;
++      outbuf += nblocks * CHACHA20_BLOCK_SIZE;
++      inbuf  += nblocks * CHACHA20_BLOCK_SIZE;
++    }
++#endif
++
++#ifdef USE_SSSE3
++  if (ctx->use_ssse3 && length >= CHACHA20_BLOCK_SIZE * 4)
++    {
++      size_t nblocks = length / CHACHA20_BLOCK_SIZE;
++      nblocks -= nblocks % 4;
++      nburn = _gcry_chacha20_amd64_ssse3_blocks4(ctx->input, outbuf, inbuf,
++						 nblocks);
++      burn = nburn > burn ? nburn : burn;
++      length -= nblocks * CHACHA20_BLOCK_SIZE;
++      outbuf += nblocks * CHACHA20_BLOCK_SIZE;
++      inbuf  += nblocks * CHACHA20_BLOCK_SIZE;
++    }
++#endif
++
++#ifdef USE_ARMV7_NEON
++  if (ctx->use_neon && length >= CHACHA20_BLOCK_SIZE * 4)
++    {
++      size_t nblocks = length / CHACHA20_BLOCK_SIZE;
++      nblocks -= nblocks % 4;
++      nburn = _gcry_chacha20_armv7_neon_blocks4(ctx->input, outbuf, inbuf,
++						nblocks);
++      burn = nburn > burn ? nburn : burn;
++      length -= nblocks * CHACHA20_BLOCK_SIZE;
++      outbuf += nblocks * CHACHA20_BLOCK_SIZE;
++      inbuf  += nblocks * CHACHA20_BLOCK_SIZE;
++    }
++#endif
++
++#ifdef USE_AARCH64_SIMD
++  if (ctx->use_neon && length >= CHACHA20_BLOCK_SIZE * 4)
++    {
++      size_t nblocks = length / CHACHA20_BLOCK_SIZE;
++      nblocks -= nblocks % 4;
++      nburn = _gcry_chacha20_aarch64_blocks4(ctx->input, outbuf, inbuf,
++					     nblocks);
++      burn = nburn > burn ? nburn : burn;
++      length -= nblocks * CHACHA20_BLOCK_SIZE;
++      outbuf += nblocks * CHACHA20_BLOCK_SIZE;
++      inbuf  += nblocks * CHACHA20_BLOCK_SIZE;
++    }
++#endif
++
++#ifdef USE_PPC_VEC
++  if (ctx->use_ppc && length >= CHACHA20_BLOCK_SIZE * 4)
++    {
++      size_t nblocks = length / CHACHA20_BLOCK_SIZE;
++      nblocks -= nblocks % 4;
++      nburn = _gcry_chacha20_ppc8_blocks4(ctx->input, outbuf, inbuf, nblocks);
++      burn = nburn > burn ? nburn : burn;
++      length -= nblocks * CHACHA20_BLOCK_SIZE;
++      outbuf += nblocks * CHACHA20_BLOCK_SIZE;
++      inbuf  += nblocks * CHACHA20_BLOCK_SIZE;
++    }
++#endif
++
++#ifdef USE_S390X_VX
++  if (ctx->use_s390x && length >= CHACHA20_BLOCK_SIZE * 8)
++    {
++      size_t nblocks = length / CHACHA20_BLOCK_SIZE;
++      nblocks -= nblocks % 8;
++      nburn = _gcry_chacha20_s390x_vx_blocks8(ctx->input, outbuf, inbuf,
++					      nblocks);
++      burn = nburn > burn ? nburn : burn;
++      length -= nblocks * CHACHA20_BLOCK_SIZE;
++      outbuf += nblocks * CHACHA20_BLOCK_SIZE;
++      inbuf  += nblocks * CHACHA20_BLOCK_SIZE;
++    }
++#endif
++
++  if (length >= CHACHA20_BLOCK_SIZE)
++    {
++      size_t nblocks = length / CHACHA20_BLOCK_SIZE;
++      nburn = chacha20_blocks(ctx, outbuf, inbuf, nblocks);
++      burn = nburn > burn ? nburn : burn;
++      length -= nblocks * CHACHA20_BLOCK_SIZE;
++      outbuf += nblocks * CHACHA20_BLOCK_SIZE;
++      inbuf  += nblocks * CHACHA20_BLOCK_SIZE;
++    }
++
++  if (length > 0)
++    {
++      nburn = chacha20_blocks(ctx, ctx->pad, zero_pad, 1);
++      burn = nburn > burn ? nburn : burn;
++
++      buf_xor (outbuf, inbuf, ctx->pad, length);
++      ctx->unused = CHACHA20_BLOCK_SIZE - length;
++    }
++
++  if (burn)
++    burn += 5 * sizeof(void *);
++
++  return burn;
++}
++
++
++static void
++chacha20_encrypt_stream (void *context, byte *outbuf, const byte *inbuf,
++                         size_t length)
++{
++  CHACHA20_context_t *ctx = (CHACHA20_context_t *) context;
++  unsigned int nburn, burn = 0;
++
++  if (!length)
++    return;
++
++  if (ctx->unused)
++    {
++      unsigned char *p = ctx->pad;
++      size_t n;
++
++      gcry_assert (ctx->unused < CHACHA20_BLOCK_SIZE);
++
++      n = ctx->unused;
++      if (n > length)
++        n = length;
++
++      buf_xor (outbuf, inbuf, p + CHACHA20_BLOCK_SIZE - ctx->unused, n);
++      length -= n;
++      outbuf += n;
++      inbuf += n;
++      ctx->unused -= n;
++
++      if (!length)
++        return;
++      gcry_assert (!ctx->unused);
++    }
++
++  nburn = do_chacha20_encrypt_stream_tail (ctx, outbuf, inbuf, length);
++  burn = nburn > burn ? nburn : burn;
++
++  if (burn)
++    _gcry_burn_stack (burn);
++}
++
++
++gcry_err_code_t
++_gcry_chacha20_poly1305_encrypt(gcry_cipher_hd_t c, byte *outbuf,
++				const byte *inbuf, size_t length)
++{
++  CHACHA20_context_t *ctx = (void *) &c->context.c;
++  unsigned int nburn, burn = 0;
++  byte *authptr = NULL;
++
++  if (!length)
++    return 0;
++
++  if (ctx->unused)
++    {
++      unsigned char *p = ctx->pad;
++      size_t n;
++
++      gcry_assert (ctx->unused < CHACHA20_BLOCK_SIZE);
++
++      n = ctx->unused;
++      if (n > length)
++        n = length;
++
++      buf_xor (outbuf, inbuf, p + CHACHA20_BLOCK_SIZE - ctx->unused, n);
++      nburn = _gcry_poly1305_update_burn (&c->u_mode.poly1305.ctx, outbuf, n);
++      burn = nburn > burn ? nburn : burn;
++      length -= n;
++      outbuf += n;
++      inbuf += n;
++      ctx->unused -= n;
++
++      if (!length)
++	{
++	  if (burn)
++	    _gcry_burn_stack (burn);
++
++	  return 0;
++	}
++      gcry_assert (!ctx->unused);
++    }
++
++  gcry_assert (c->u_mode.poly1305.ctx.leftover == 0);
++
++  if (0)
++    { }
++#ifdef USE_AVX2
++  else if (ctx->use_avx2 && length >= CHACHA20_BLOCK_SIZE * 8)
++    {
++      nburn = _gcry_chacha20_amd64_avx2_blocks8(ctx->input, outbuf, inbuf, 8);
++      burn = nburn > burn ? nburn : burn;
++
++      authptr = outbuf;
++      length -= 8 * CHACHA20_BLOCK_SIZE;
++      outbuf += 8 * CHACHA20_BLOCK_SIZE;
++      inbuf  += 8 * CHACHA20_BLOCK_SIZE;
++    }
++#endif
++#ifdef USE_SSSE3
++  else if (ctx->use_ssse3 && length >= CHACHA20_BLOCK_SIZE * 4)
++    {
++      nburn = _gcry_chacha20_amd64_ssse3_blocks4(ctx->input, outbuf, inbuf, 4);
++      burn = nburn > burn ? nburn : burn;
++
++      authptr = outbuf;
++      length -= 4 * CHACHA20_BLOCK_SIZE;
++      outbuf += 4 * CHACHA20_BLOCK_SIZE;
++      inbuf  += 4 * CHACHA20_BLOCK_SIZE;
++    }
++  else if (ctx->use_ssse3 && length >= CHACHA20_BLOCK_SIZE * 2)
++    {
++      nburn = _gcry_chacha20_amd64_ssse3_blocks1(ctx->input, outbuf, inbuf, 2);
++      burn = nburn > burn ? nburn : burn;
++
++      authptr = outbuf;
++      length -= 2 * CHACHA20_BLOCK_SIZE;
++      outbuf += 2 * CHACHA20_BLOCK_SIZE;
++      inbuf  += 2 * CHACHA20_BLOCK_SIZE;
++    }
++  else if (ctx->use_ssse3 && length >= CHACHA20_BLOCK_SIZE)
++    {
++      nburn = _gcry_chacha20_amd64_ssse3_blocks1(ctx->input, outbuf, inbuf, 1);
++      burn = nburn > burn ? nburn : burn;
++
++      authptr = outbuf;
++      length -= 1 * CHACHA20_BLOCK_SIZE;
++      outbuf += 1 * CHACHA20_BLOCK_SIZE;
++      inbuf  += 1 * CHACHA20_BLOCK_SIZE;
++    }
++#endif
++#ifdef USE_AARCH64_SIMD
++  else if (ctx->use_neon && length >= CHACHA20_BLOCK_SIZE * 4)
++    {
++      nburn = _gcry_chacha20_aarch64_blocks4(ctx->input, outbuf, inbuf, 4);
++      burn = nburn > burn ? nburn : burn;
++
++      authptr = outbuf;
++      length -= 4 * CHACHA20_BLOCK_SIZE;
++      outbuf += 4 * CHACHA20_BLOCK_SIZE;
++      inbuf  += 4 * CHACHA20_BLOCK_SIZE;
++    }
++#endif
++#ifdef USE_PPC_VEC_POLY1305
++  else if (ctx->use_ppc && length >= CHACHA20_BLOCK_SIZE * 4)
++    {
++      nburn = _gcry_chacha20_ppc8_blocks4(ctx->input, outbuf, inbuf, 4);
++      burn = nburn > burn ? nburn : burn;
++
++      authptr = outbuf;
++      length -= 4 * CHACHA20_BLOCK_SIZE;
++      outbuf += 4 * CHACHA20_BLOCK_SIZE;
++      inbuf  += 4 * CHACHA20_BLOCK_SIZE;
++    }
++#endif
++#ifdef USE_S390X_VX_POLY1305
++  else if (ctx->use_s390x && length >= 2 * CHACHA20_BLOCK_SIZE * 8)
++    {
++      nburn = _gcry_chacha20_s390x_vx_blocks8(ctx->input, outbuf, inbuf, 8);
++      burn = nburn > burn ? nburn : burn;
++
++      authptr = outbuf;
++      length -= 8 * CHACHA20_BLOCK_SIZE;
++      outbuf += 8 * CHACHA20_BLOCK_SIZE;
++      inbuf  += 8 * CHACHA20_BLOCK_SIZE;
++    }
++  else if (ctx->use_s390x && length >= CHACHA20_BLOCK_SIZE * 4)
++    {
++      nburn = _gcry_chacha20_s390x_vx_blocks4_2_1(ctx->input, outbuf, inbuf, 4);
++      burn = nburn > burn ? nburn : burn;
++
++      authptr = outbuf;
++      length -= 4 * CHACHA20_BLOCK_SIZE;
++      outbuf += 4 * CHACHA20_BLOCK_SIZE;
++      inbuf  += 4 * CHACHA20_BLOCK_SIZE;
++    }
++  else if (ctx->use_s390x && length >= CHACHA20_BLOCK_SIZE * 2)
++    {
++      nburn = _gcry_chacha20_s390x_vx_blocks4_2_1(ctx->input, outbuf, inbuf, 2);
++      burn = nburn > burn ? nburn : burn;
++
++      authptr = outbuf;
++      length -= 2 * CHACHA20_BLOCK_SIZE;
++      outbuf += 2 * CHACHA20_BLOCK_SIZE;
++      inbuf  += 2 * CHACHA20_BLOCK_SIZE;
++    }
++  else if (ctx->use_s390x && length >= CHACHA20_BLOCK_SIZE)
++    {
++      nburn = _gcry_chacha20_s390x_vx_blocks4_2_1(ctx->input, outbuf, inbuf, 1);
++      burn = nburn > burn ? nburn : burn;
++
++      authptr = outbuf;
++      length -= 1 * CHACHA20_BLOCK_SIZE;
++      outbuf += 1 * CHACHA20_BLOCK_SIZE;
++      inbuf  += 1 * CHACHA20_BLOCK_SIZE;
++    }
++#endif
++
++  if (authptr)
++    {
++      size_t authoffset = outbuf - authptr;
++
++#ifdef USE_AVX2
++      if (ctx->use_avx2 &&
++	  length >= 8 * CHACHA20_BLOCK_SIZE &&
++	  authoffset >= 8 * CHACHA20_BLOCK_SIZE)
++	{
++	  size_t nblocks = length / CHACHA20_BLOCK_SIZE;
++	  nblocks -= nblocks % 8;
++
++	  nburn = _gcry_chacha20_poly1305_amd64_avx2_blocks8(
++		      ctx->input, outbuf, inbuf, nblocks,
++		      &c->u_mode.poly1305.ctx.state, authptr);
++	  burn = nburn > burn ? nburn : burn;
++
++	  length  -= nblocks * CHACHA20_BLOCK_SIZE;
++	  outbuf  += nblocks * CHACHA20_BLOCK_SIZE;
++	  inbuf   += nblocks * CHACHA20_BLOCK_SIZE;
++	  authptr += nblocks * CHACHA20_BLOCK_SIZE;
++	}
++#endif
++
++#ifdef USE_SSSE3
++      if (ctx->use_ssse3)
++	{
++	  if (length >= 4 * CHACHA20_BLOCK_SIZE &&
++	      authoffset >= 4 * CHACHA20_BLOCK_SIZE)
++	    {
++	      size_t nblocks = length / CHACHA20_BLOCK_SIZE;
++	      nblocks -= nblocks % 4;
++
++	      nburn = _gcry_chacha20_poly1305_amd64_ssse3_blocks4(
++			  ctx->input, outbuf, inbuf, nblocks,
++			  &c->u_mode.poly1305.ctx.state, authptr);
++	      burn = nburn > burn ? nburn : burn;
++
++	      length  -= nblocks * CHACHA20_BLOCK_SIZE;
++	      outbuf  += nblocks * CHACHA20_BLOCK_SIZE;
++	      inbuf   += nblocks * CHACHA20_BLOCK_SIZE;
++	      authptr += nblocks * CHACHA20_BLOCK_SIZE;
++	    }
++
++	  if (length >= CHACHA20_BLOCK_SIZE &&
++	      authoffset >= CHACHA20_BLOCK_SIZE)
++	    {
++	      size_t nblocks = length / CHACHA20_BLOCK_SIZE;
++
++	      nburn = _gcry_chacha20_poly1305_amd64_ssse3_blocks1(
++			  ctx->input, outbuf, inbuf, nblocks,
++			  &c->u_mode.poly1305.ctx.state, authptr);
++	      burn = nburn > burn ? nburn : burn;
++
++	      length  -= nblocks * CHACHA20_BLOCK_SIZE;
++	      outbuf  += nblocks * CHACHA20_BLOCK_SIZE;
++	      inbuf   += nblocks * CHACHA20_BLOCK_SIZE;
++	      authptr += nblocks * CHACHA20_BLOCK_SIZE;
++	    }
++	}
++#endif
++
++#ifdef USE_AARCH64_SIMD
++      if (ctx->use_neon &&
++	  length >= 4 * CHACHA20_BLOCK_SIZE &&
++	  authoffset >= 4 * CHACHA20_BLOCK_SIZE)
++	{
++	  size_t nblocks = length / CHACHA20_BLOCK_SIZE;
++	  nblocks -= nblocks % 4;
++
++	  nburn = _gcry_chacha20_poly1305_aarch64_blocks4(
++		      ctx->input, outbuf, inbuf, nblocks,
++		      &c->u_mode.poly1305.ctx.state, authptr);
++	  burn = nburn > burn ? nburn : burn;
++
++	  length  -= nblocks * CHACHA20_BLOCK_SIZE;
++	  outbuf  += nblocks * CHACHA20_BLOCK_SIZE;
++	  inbuf   += nblocks * CHACHA20_BLOCK_SIZE;
++	  authptr += nblocks * CHACHA20_BLOCK_SIZE;
++	}
++#endif
++
++#ifdef USE_PPC_VEC_POLY1305
++      if (ctx->use_ppc &&
++	  length >= 4 * CHACHA20_BLOCK_SIZE &&
++	  authoffset >= 4 * CHACHA20_BLOCK_SIZE)
++	{
++	  size_t nblocks = length / CHACHA20_BLOCK_SIZE;
++	  nblocks -= nblocks % 4;
++
++	  nburn = _gcry_chacha20_poly1305_ppc8_blocks4(
++		      ctx->input, outbuf, inbuf, nblocks,
++		      &c->u_mode.poly1305.ctx.state, authptr);
++	  burn = nburn > burn ? nburn : burn;
++
++	  length  -= nblocks * CHACHA20_BLOCK_SIZE;
++	  outbuf  += nblocks * CHACHA20_BLOCK_SIZE;
++	  inbuf   += nblocks * CHACHA20_BLOCK_SIZE;
++	  authptr += nblocks * CHACHA20_BLOCK_SIZE;
++	}
++#endif
++
++#ifdef USE_S390X_VX_POLY1305
++      if (ctx->use_s390x)
++	{
++	  if (length >= 8 * CHACHA20_BLOCK_SIZE &&
++	      authoffset >= 8 * CHACHA20_BLOCK_SIZE)
++	    {
++	      size_t nblocks = length / CHACHA20_BLOCK_SIZE;
++	      nblocks -= nblocks % 8;
++
++	      burn = _gcry_chacha20_poly1305_s390x_vx_blocks8(
++			  ctx->input, outbuf, inbuf, nblocks,
++			  &c->u_mode.poly1305.ctx.state, authptr);
++	      burn = nburn > burn ? nburn : burn;
++
++	      length  -= nblocks * CHACHA20_BLOCK_SIZE;
++	      outbuf  += nblocks * CHACHA20_BLOCK_SIZE;
++	      inbuf   += nblocks * CHACHA20_BLOCK_SIZE;
++	      authptr += nblocks * CHACHA20_BLOCK_SIZE;
++	    }
++
++	  if (length >= CHACHA20_BLOCK_SIZE &&
++	      authoffset >= CHACHA20_BLOCK_SIZE)
++	    {
++	      size_t nblocks = length / CHACHA20_BLOCK_SIZE;
++
++	      burn = _gcry_chacha20_poly1305_s390x_vx_blocks4_2_1(
++			  ctx->input, outbuf, inbuf, nblocks,
++			  &c->u_mode.poly1305.ctx.state, authptr);
++	      burn = nburn > burn ? nburn : burn;
++
++	      length  -= nblocks * CHACHA20_BLOCK_SIZE;
++	      outbuf  += nblocks * CHACHA20_BLOCK_SIZE;
++	      inbuf   += nblocks * CHACHA20_BLOCK_SIZE;
++	      authptr += nblocks * CHACHA20_BLOCK_SIZE;
++	    }
++	}
++#endif
++
++      if (authoffset > 0)
++	{
++	  _gcry_poly1305_update (&c->u_mode.poly1305.ctx, authptr, authoffset);
++	  authptr += authoffset;
++	  authoffset = 0;
++	}
++
++      gcry_assert(authptr == outbuf);
++    }
++
++  while (length)
++    {
++      size_t currlen = length;
++
++      /* Since checksumming is done after encryption, process input in 24KiB
++       * chunks to keep data loaded in L1 cache for checksumming. */
++      if (currlen > 24 * 1024)
++	currlen = 24 * 1024;
++
++      nburn = do_chacha20_encrypt_stream_tail (ctx, outbuf, inbuf, currlen);
++      burn = nburn > burn ? nburn : burn;
++
++      nburn = _gcry_poly1305_update_burn (&c->u_mode.poly1305.ctx, outbuf,
++					  currlen);
++      burn = nburn > burn ? nburn : burn;
++
++      outbuf += currlen;
++      inbuf += currlen;
++      length -= currlen;
++    }
++
++  if (burn)
++    _gcry_burn_stack (burn);
++
++  return 0;
++}
++
++
++gcry_err_code_t
++_gcry_chacha20_poly1305_decrypt(gcry_cipher_hd_t c, byte *outbuf,
++				const byte *inbuf, size_t length)
++{
++  CHACHA20_context_t *ctx = (void *) &c->context.c;
++  unsigned int nburn, burn = 0;
++
++  if (!length)
++    return 0;
++
++  if (ctx->unused)
++    {
++      unsigned char *p = ctx->pad;
++      size_t n;
++
++      gcry_assert (ctx->unused < CHACHA20_BLOCK_SIZE);
++
++      n = ctx->unused;
++      if (n > length)
++        n = length;
++
++      nburn = _gcry_poly1305_update_burn (&c->u_mode.poly1305.ctx, inbuf, n);
++      burn = nburn > burn ? nburn : burn;
++      buf_xor (outbuf, inbuf, p + CHACHA20_BLOCK_SIZE - ctx->unused, n);
++      length -= n;
++      outbuf += n;
++      inbuf += n;
++      ctx->unused -= n;
++
++      if (!length)
++	{
++	  if (burn)
++	    _gcry_burn_stack (burn);
++
++	  return 0;
++	}
++      gcry_assert (!ctx->unused);
++    }
++
++  gcry_assert (c->u_mode.poly1305.ctx.leftover == 0);
++
++#ifdef USE_AVX2
++  if (ctx->use_avx2 && length >= 8 * CHACHA20_BLOCK_SIZE)
++    {
++      size_t nblocks = length / CHACHA20_BLOCK_SIZE;
++      nblocks -= nblocks % 8;
++
++      nburn = _gcry_chacha20_poly1305_amd64_avx2_blocks8(
++			ctx->input, outbuf, inbuf, nblocks,
++			&c->u_mode.poly1305.ctx.state, inbuf);
++      burn = nburn > burn ? nburn : burn;
++
++      length -= nblocks * CHACHA20_BLOCK_SIZE;
++      outbuf += nblocks * CHACHA20_BLOCK_SIZE;
++      inbuf  += nblocks * CHACHA20_BLOCK_SIZE;
++    }
++#endif
++
++#ifdef USE_SSSE3
++  if (ctx->use_ssse3)
++    {
++      if (length >= 4 * CHACHA20_BLOCK_SIZE)
++	{
++	  size_t nblocks = length / CHACHA20_BLOCK_SIZE;
++	  nblocks -= nblocks % 4;
++
++	  nburn = _gcry_chacha20_poly1305_amd64_ssse3_blocks4(
++			    ctx->input, outbuf, inbuf, nblocks,
++			    &c->u_mode.poly1305.ctx.state, inbuf);
++	  burn = nburn > burn ? nburn : burn;
++
++	  length -= nblocks * CHACHA20_BLOCK_SIZE;
++	  outbuf += nblocks * CHACHA20_BLOCK_SIZE;
++	  inbuf  += nblocks * CHACHA20_BLOCK_SIZE;
++	}
++
++      if (length >= CHACHA20_BLOCK_SIZE)
++	{
++	  size_t nblocks = length / CHACHA20_BLOCK_SIZE;
++
++	  nburn = _gcry_chacha20_poly1305_amd64_ssse3_blocks1(
++			    ctx->input, outbuf, inbuf, nblocks,
++			    &c->u_mode.poly1305.ctx.state, inbuf);
++	  burn = nburn > burn ? nburn : burn;
++
++	  length -= nblocks * CHACHA20_BLOCK_SIZE;
++	  outbuf += nblocks * CHACHA20_BLOCK_SIZE;
++	  inbuf  += nblocks * CHACHA20_BLOCK_SIZE;
++	}
++    }
++#endif
++
++#ifdef USE_AARCH64_SIMD
++  if (ctx->use_neon && length >= 4 * CHACHA20_BLOCK_SIZE)
++    {
++      size_t nblocks = length / CHACHA20_BLOCK_SIZE;
++      nblocks -= nblocks % 4;
++
++      nburn = _gcry_chacha20_poly1305_aarch64_blocks4(
++			ctx->input, outbuf, inbuf, nblocks,
++			&c->u_mode.poly1305.ctx.state, inbuf);
++      burn = nburn > burn ? nburn : burn;
++
++      length -= nblocks * CHACHA20_BLOCK_SIZE;
++      outbuf += nblocks * CHACHA20_BLOCK_SIZE;
++      inbuf  += nblocks * CHACHA20_BLOCK_SIZE;
++    }
++#endif
++
++#ifdef USE_PPC_VEC_POLY1305
++  if (ctx->use_ppc && length >= 4 * CHACHA20_BLOCK_SIZE)
++    {
++      size_t nblocks = length / CHACHA20_BLOCK_SIZE;
++      nblocks -= nblocks % 4;
++
++      nburn = _gcry_chacha20_poly1305_ppc8_blocks4(
++			ctx->input, outbuf, inbuf, nblocks,
++			&c->u_mode.poly1305.ctx.state, inbuf);
++      burn = nburn > burn ? nburn : burn;
++
++      length -= nblocks * CHACHA20_BLOCK_SIZE;
++      outbuf += nblocks * CHACHA20_BLOCK_SIZE;
++      inbuf  += nblocks * CHACHA20_BLOCK_SIZE;
++    }
++#endif
++
++#ifdef USE_S390X_VX_POLY1305
++  if (ctx->use_s390x)
++    {
++      if (length >= 8 * CHACHA20_BLOCK_SIZE)
++	{
++	  size_t nblocks = length / CHACHA20_BLOCK_SIZE;
++	  nblocks -= nblocks % 8;
++
++	  nburn = _gcry_chacha20_poly1305_s390x_vx_blocks8(
++			    ctx->input, outbuf, inbuf, nblocks,
++			    &c->u_mode.poly1305.ctx.state, inbuf);
++	  burn = nburn > burn ? nburn : burn;
++
++	  length -= nblocks * CHACHA20_BLOCK_SIZE;
++	  outbuf += nblocks * CHACHA20_BLOCK_SIZE;
++	  inbuf  += nblocks * CHACHA20_BLOCK_SIZE;
++	}
++
++      if (length >= CHACHA20_BLOCK_SIZE)
++	{
++	  size_t nblocks = length / CHACHA20_BLOCK_SIZE;
++
++	  nburn = _gcry_chacha20_poly1305_s390x_vx_blocks4_2_1(
++			    ctx->input, outbuf, inbuf, nblocks,
++			    &c->u_mode.poly1305.ctx.state, inbuf);
++	  burn = nburn > burn ? nburn : burn;
++
++	  length -= nblocks * CHACHA20_BLOCK_SIZE;
++	  outbuf += nblocks * CHACHA20_BLOCK_SIZE;
++	  inbuf  += nblocks * CHACHA20_BLOCK_SIZE;
++	}
++    }
++#endif
++
++  while (length)
++    {
++      size_t currlen = length;
++
++      /* Since checksumming is done before decryption, process input in 24KiB
++       * chunks to keep data loaded in L1 cache for decryption. */
++      if (currlen > 24 * 1024)
++	currlen = 24 * 1024;
++
++      nburn = _gcry_poly1305_update_burn (&c->u_mode.poly1305.ctx, inbuf,
++					  currlen);
++      burn = nburn > burn ? nburn : burn;
++
++      nburn = do_chacha20_encrypt_stream_tail (ctx, outbuf, inbuf, currlen);
++      burn = nburn > burn ? nburn : burn;
++
++      outbuf += currlen;
++      inbuf += currlen;
++      length -= currlen;
++    }
++
++  if (burn)
++    _gcry_burn_stack (burn);
++
++  return 0;
++}
++
++
++static const char *
++selftest (void)
++{
++  byte ctxbuf[sizeof(CHACHA20_context_t) + 15];
++  CHACHA20_context_t *ctx;
++  byte scratch[127 + 1];
++  byte buf[512 + 64 + 4];
++  int i;
++
++  /* From draft-strombergson-chacha-test-vectors */
++  static byte key_1[] = {
++    0xc4, 0x6e, 0xc1, 0xb1, 0x8c, 0xe8, 0xa8, 0x78,
++    0x72, 0x5a, 0x37, 0xe7, 0x80, 0xdf, 0xb7, 0x35,
++    0x1f, 0x68, 0xed, 0x2e, 0x19, 0x4c, 0x79, 0xfb,
++    0xc6, 0xae, 0xbe, 0xe1, 0xa6, 0x67, 0x97, 0x5d
++  };
++  static const byte nonce_1[] =
++    { 0x1a, 0xda, 0x31, 0xd5, 0xcf, 0x68, 0x82, 0x21 };
++  static const byte plaintext_1[127] = {
++    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
++    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
++    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
++    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
++    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
++    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
++    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
++    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
++    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
++    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
++    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
++    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
++    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
++    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
++    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
++    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
++  };
++  static const byte ciphertext_1[127] = {
++    0xf6, 0x3a, 0x89, 0xb7, 0x5c, 0x22, 0x71, 0xf9,
++    0x36, 0x88, 0x16, 0x54, 0x2b, 0xa5, 0x2f, 0x06,
++    0xed, 0x49, 0x24, 0x17, 0x92, 0x30, 0x2b, 0x00,
++    0xb5, 0xe8, 0xf8, 0x0a, 0xe9, 0xa4, 0x73, 0xaf,
++    0xc2, 0x5b, 0x21, 0x8f, 0x51, 0x9a, 0xf0, 0xfd,
++    0xd4, 0x06, 0x36, 0x2e, 0x8d, 0x69, 0xde, 0x7f,
++    0x54, 0xc6, 0x04, 0xa6, 0xe0, 0x0f, 0x35, 0x3f,
++    0x11, 0x0f, 0x77, 0x1b, 0xdc, 0xa8, 0xab, 0x92,
++    0xe5, 0xfb, 0xc3, 0x4e, 0x60, 0xa1, 0xd9, 0xa9,
++    0xdb, 0x17, 0x34, 0x5b, 0x0a, 0x40, 0x27, 0x36,
++    0x85, 0x3b, 0xf9, 0x10, 0xb0, 0x60, 0xbd, 0xf1,
++    0xf8, 0x97, 0xb6, 0x29, 0x0f, 0x01, 0xd1, 0x38,
++    0xae, 0x2c, 0x4c, 0x90, 0x22, 0x5b, 0xa9, 0xea,
++    0x14, 0xd5, 0x18, 0xf5, 0x59, 0x29, 0xde, 0xa0,
++    0x98, 0xca, 0x7a, 0x6c, 0xcf, 0xe6, 0x12, 0x27,
++    0x05, 0x3c, 0x84, 0xe4, 0x9a, 0x4a, 0x33
++  };
++
++  /* 16-byte alignment required for amd64 implementation. */
++  ctx = (CHACHA20_context_t *)((uintptr_t)(ctxbuf + 15) & ~(uintptr_t)15);
++
++  chacha20_setkey (ctx, key_1, sizeof key_1, NULL);
++  chacha20_setiv (ctx, nonce_1, sizeof nonce_1);
++  scratch[sizeof (scratch) - 1] = 0;
++  chacha20_encrypt_stream (ctx, scratch, plaintext_1, sizeof plaintext_1);
++  if (memcmp (scratch, ciphertext_1, sizeof ciphertext_1))
++    return "ChaCha20 encryption test 1 failed.";
++  if (scratch[sizeof (scratch) - 1])
++    return "ChaCha20 wrote too much.";
++  chacha20_setkey (ctx, key_1, sizeof (key_1), NULL);
++  chacha20_setiv (ctx, nonce_1, sizeof nonce_1);
++  chacha20_encrypt_stream (ctx, scratch, scratch, sizeof plaintext_1);
++  if (memcmp (scratch, plaintext_1, sizeof plaintext_1))
++    return "ChaCha20 decryption test 1 failed.";
++
++  for (i = 0; i < sizeof buf; i++)
++    buf[i] = i;
++  chacha20_setkey (ctx, key_1, sizeof key_1, NULL);
++  chacha20_setiv (ctx, nonce_1, sizeof nonce_1);
++  /*encrypt */
++  chacha20_encrypt_stream (ctx, buf, buf, sizeof buf);
++  /*decrypt */
++  chacha20_setkey (ctx, key_1, sizeof key_1, NULL);
++  chacha20_setiv (ctx, nonce_1, sizeof nonce_1);
++  chacha20_encrypt_stream (ctx, buf, buf, 1);
++  chacha20_encrypt_stream (ctx, buf + 1, buf + 1, (sizeof buf) - 1 - 1);
++  chacha20_encrypt_stream (ctx, buf + (sizeof buf) - 1,
++                           buf + (sizeof buf) - 1, 1);
++  for (i = 0; i < sizeof buf; i++)
++    if (buf[i] != (byte) i)
++      return "ChaCha20 encryption test 2 failed.";
++
++  chacha20_setkey (ctx, key_1, sizeof key_1, NULL);
++  chacha20_setiv (ctx, nonce_1, sizeof nonce_1);
++  /* encrypt */
++  for (i = 0; i < sizeof buf; i++)
++    chacha20_encrypt_stream (ctx, &buf[i], &buf[i], 1);
++  /* decrypt */
++  chacha20_setkey (ctx, key_1, sizeof key_1, NULL);
++  chacha20_setiv (ctx, nonce_1, sizeof nonce_1);
++  chacha20_encrypt_stream (ctx, buf, buf, sizeof buf);
++  for (i = 0; i < sizeof buf; i++)
++    if (buf[i] != (byte) i)
++      return "ChaCha20 encryption test 3 failed.";
++
++  return NULL;
++}
++
++
++gcry_cipher_spec_t _gcry_cipher_spec_chacha20 = {
++  GCRY_CIPHER_CHACHA20,
++  {0, 0},                       /* flags */
++  "CHACHA20",                   /* name */
++  NULL,                         /* aliases */
++  NULL,                         /* oids */
++  1,                            /* blocksize in bytes. */
++  CHACHA20_MAX_KEY_SIZE * 8,    /* standard key length in bits. */
++  sizeof (CHACHA20_context_t),
++  chacha20_setkey,
++  NULL,
++  NULL,
++  chacha20_encrypt_stream,
++  chacha20_encrypt_stream,
++  NULL,
++  NULL,
++  chacha20_setiv
++};
++
++#endif /* ENABLE_PPC_CRYPTO_SUPPORT */
+diff --git a/cipher/chacha20-ppc.c b/cipher/chacha20-ppc.c
+new file mode 100644
+index 00000000..565b7156
+--- /dev/null
++++ b/cipher/chacha20-ppc.c
+@@ -0,0 +1,646 @@
++/* chacha20-ppc.c - PowerPC vector implementation of ChaCha20
++ * Copyright (C) 2019 Jussi Kivilinna <jussi.kivilinna@iki.fi>
++ *
++ * This file is part of Libgcrypt.
++ *
++ * Libgcrypt is free software; you can redistribute it and/or modify
++ * it under the terms of the GNU Lesser General Public License as
++ * published by the Free Software Foundation; either version 2.1 of
++ * the License, or (at your option) any later version.
++ *
++ * Libgcrypt is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++ * GNU Lesser General Public License for more details.
++ *
++ * You should have received a copy of the GNU Lesser General Public
++ * License along with this program; if not, see <http://www.gnu.org/licenses/>.
++ */
++
++#include <config.h>
++
++#if defined(ENABLE_PPC_CRYPTO_SUPPORT) && \
++    defined(HAVE_COMPATIBLE_CC_PPC_ALTIVEC) && \
++    defined(HAVE_GCC_INLINE_ASM_PPC_ALTIVEC) && \
++    defined(USE_CHACHA20) && \
++    __GNUC__ >= 4
++
++#include <altivec.h>
++#include "bufhelp.h"
++#include "poly1305-internal-new.h"
++
++#include "mpi/mpi-internal.h"
++#include "mpi/longlong.h"
++
++
++typedef vector unsigned char vector16x_u8;
++typedef vector unsigned int vector4x_u32;
++typedef vector unsigned long long vector2x_u64;
++
++
++#define ALWAYS_INLINE inline __attribute__((always_inline))
++#define NO_INLINE __attribute__((noinline))
++#define NO_INSTRUMENT_FUNCTION __attribute__((no_instrument_function))
++
++#define ASM_FUNC_ATTR          NO_INSTRUMENT_FUNCTION
++#define ASM_FUNC_ATTR_INLINE   ASM_FUNC_ATTR ALWAYS_INLINE
++#define ASM_FUNC_ATTR_NOINLINE ASM_FUNC_ATTR NO_INLINE
++
++
++#ifdef WORDS_BIGENDIAN
++static const vector16x_u8 le_bswap_const =
++  { 3, 2, 1, 0, 7, 6, 5, 4, 11, 10, 9, 8, 15, 14, 13, 12 };
++#endif
++
++
++static ASM_FUNC_ATTR_INLINE vector4x_u32
++vec_rol_elems(vector4x_u32 v, unsigned int idx)
++{
++#ifndef WORDS_BIGENDIAN
++  return vec_sld (v, v, (16 - (4 * idx)) & 15);
++#else
++  return vec_sld (v, v, (4 * idx) & 15);
++#endif
++}
++
++
++static ASM_FUNC_ATTR_INLINE vector4x_u32
++vec_load_le(unsigned long offset, const unsigned char *ptr)
++{
++  vector4x_u32 vec;
++  vec = vec_vsx_ld (offset, (const u32 *)ptr);
++#ifdef WORDS_BIGENDIAN
++  vec = (vector4x_u32)vec_perm((vector16x_u8)vec, (vector16x_u8)vec,
++			       le_bswap_const);
++#endif
++  return vec;
++}
++
++
++static ASM_FUNC_ATTR_INLINE void
++vec_store_le(vector4x_u32 vec, unsigned long offset, unsigned char *ptr)
++{
++#ifdef WORDS_BIGENDIAN
++  vec = (vector4x_u32)vec_perm((vector16x_u8)vec, (vector16x_u8)vec,
++			       le_bswap_const);
++#endif
++  vec_vsx_st (vec, offset, (u32 *)ptr);
++}
++
++
++static ASM_FUNC_ATTR_INLINE vector4x_u32
++vec_add_ctr_u64(vector4x_u32 v, vector4x_u32 a)
++{
++#ifdef WORDS_BIGENDIAN
++  static const vector16x_u8 swap32 =
++    { 4, 5, 6, 7, 0, 1, 2, 3, 12, 13, 14, 15, 8, 9, 10, 11 };
++  vector2x_u64 vec, add, sum;
++
++  vec = (vector2x_u64)vec_perm((vector16x_u8)v, (vector16x_u8)v, swap32);
++  add = (vector2x_u64)vec_perm((vector16x_u8)a, (vector16x_u8)a, swap32);
++  sum = vec + add;
++  return (vector4x_u32)vec_perm((vector16x_u8)sum, (vector16x_u8)sum, swap32);
++#else
++  return (vector4x_u32)((vector2x_u64)(v) + (vector2x_u64)(a));
++#endif
++}
++
++
++/**********************************************************************
++  2-way && 1-way chacha20
++ **********************************************************************/
++
++#define ROTATE(v1,rolv)			\
++	__asm__ ("vrlw %0,%1,%2\n\t" : "=v" (v1) : "v" (v1), "v" (rolv))
++
++#define WORD_ROL(v1,c)			\
++	((v1) = vec_rol_elems((v1), (c)))
++
++#define XOR(ds,s) \
++	((ds) ^= (s))
++
++#define PLUS(ds,s) \
++	((ds) += (s))
++
++#define QUARTERROUND4(x0,x1,x2,x3,rol_x1,rol_x2,rol_x3) \
++	PLUS(x0, x1); XOR(x3, x0); ROTATE(x3, rotate_16); \
++	PLUS(x2, x3); XOR(x1, x2); ROTATE(x1, rotate_12); \
++	PLUS(x0, x1); XOR(x3, x0); ROTATE(x3, rotate_8); \
++	PLUS(x2, x3); \
++	  WORD_ROL(x3, rol_x3); \
++		      XOR(x1, x2); \
++	  WORD_ROL(x2, rol_x2); \
++				   ROTATE(x1, rotate_7); \
++	  WORD_ROL(x1, rol_x1);
++
++#define ADD_U64(v,a) \
++	(v = vec_add_ctr_u64(v, a))
++
++unsigned int ASM_FUNC_ATTR
++_gcry_chacha20_ppc8_blocks1(u32 *state, byte *dst, const byte *src,
++			    size_t nblks)
++{
++  vector4x_u32 counter_1 = { 1, 0, 0, 0 };
++  vector4x_u32 rotate_16 = { 16, 16, 16, 16 };
++  vector4x_u32 rotate_12 = { 12, 12, 12, 12 };
++  vector4x_u32 rotate_8 = { 8, 8, 8, 8 };
++  vector4x_u32 rotate_7 = { 7, 7, 7, 7 };
++  vector4x_u32 state0, state1, state2, state3;
++  vector4x_u32 v0, v1, v2, v3;
++  vector4x_u32 v4, v5, v6, v7;
++  int i;
++
++  /* force preload of constants to vector registers */
++  __asm__ ("": "+v" (counter_1) :: "memory");
++  __asm__ ("": "+v" (rotate_16) :: "memory");
++  __asm__ ("": "+v" (rotate_12) :: "memory");
++  __asm__ ("": "+v" (rotate_8) :: "memory");
++  __asm__ ("": "+v" (rotate_7) :: "memory");
++
++  state0 = vec_vsx_ld(0 * 16, state);
++  state1 = vec_vsx_ld(1 * 16, state);
++  state2 = vec_vsx_ld(2 * 16, state);
++  state3 = vec_vsx_ld(3 * 16, state);
++
++  while (nblks >= 2)
++    {
++      v0 = state0;
++      v1 = state1;
++      v2 = state2;
++      v3 = state3;
++
++      v4 = state0;
++      v5 = state1;
++      v6 = state2;
++      v7 = state3;
++      ADD_U64(v7, counter_1);
++
++      for (i = 20; i > 0; i -= 2)
++	{
++	  QUARTERROUND4(v0, v1, v2, v3, 1, 2, 3);
++	  QUARTERROUND4(v4, v5, v6, v7, 1, 2, 3);
++	  QUARTERROUND4(v0, v1, v2, v3, 3, 2, 1);
++	  QUARTERROUND4(v4, v5, v6, v7, 3, 2, 1);
++	}
++
++      v0 += state0;
++      v1 += state1;
++      v2 += state2;
++      v3 += state3;
++      ADD_U64(state3, counter_1); /* update counter */
++      v4 += state0;
++      v5 += state1;
++      v6 += state2;
++      v7 += state3;
++      ADD_U64(state3, counter_1); /* update counter */
++
++      v0 ^= vec_load_le(0 * 16, src);
++      v1 ^= vec_load_le(1 * 16, src);
++      v2 ^= vec_load_le(2 * 16, src);
++      v3 ^= vec_load_le(3 * 16, src);
++      vec_store_le(v0, 0 * 16, dst);
++      vec_store_le(v1, 1 * 16, dst);
++      vec_store_le(v2, 2 * 16, dst);
++      vec_store_le(v3, 3 * 16, dst);
++      src += 64;
++      dst += 64;
++      v4 ^= vec_load_le(0 * 16, src);
++      v5 ^= vec_load_le(1 * 16, src);
++      v6 ^= vec_load_le(2 * 16, src);
++      v7 ^= vec_load_le(3 * 16, src);
++      vec_store_le(v4, 0 * 16, dst);
++      vec_store_le(v5, 1 * 16, dst);
++      vec_store_le(v6, 2 * 16, dst);
++      vec_store_le(v7, 3 * 16, dst);
++      src += 64;
++      dst += 64;
++
++      nblks -= 2;
++    }
++
++  while (nblks)
++    {
++      v0 = state0;
++      v1 = state1;
++      v2 = state2;
++      v3 = state3;
++
++      for (i = 20; i > 0; i -= 2)
++	{
++	  QUARTERROUND4(v0, v1, v2, v3, 1, 2, 3);
++	  QUARTERROUND4(v0, v1, v2, v3, 3, 2, 1);
++	}
++
++      v0 += state0;
++      v1 += state1;
++      v2 += state2;
++      v3 += state3;
++      ADD_U64(state3, counter_1); /* update counter */
++
++      v0 ^= vec_load_le(0 * 16, src);
++      v1 ^= vec_load_le(1 * 16, src);
++      v2 ^= vec_load_le(2 * 16, src);
++      v3 ^= vec_load_le(3 * 16, src);
++      vec_store_le(v0, 0 * 16, dst);
++      vec_store_le(v1, 1 * 16, dst);
++      vec_store_le(v2, 2 * 16, dst);
++      vec_store_le(v3, 3 * 16, dst);
++      src += 64;
++      dst += 64;
++
++      nblks--;
++    }
++
++  vec_vsx_st(state3, 3 * 16, state); /* store counter */
++
++  return 0;
++}
++
++
++/**********************************************************************
++  4-way chacha20
++ **********************************************************************/
++
++/* 4x4 32-bit integer matrix transpose */
++#define transpose_4x4(x0, x1, x2, x3) ({ \
++	vector4x_u32 t1 = vec_mergeh(x0, x2); \
++	vector4x_u32 t2 = vec_mergel(x0, x2); \
++	vector4x_u32 t3 = vec_mergeh(x1, x3); \
++	x3 = vec_mergel(x1, x3); \
++	x0 = vec_mergeh(t1, t3); \
++	x1 = vec_mergel(t1, t3); \
++	x2 = vec_mergeh(t2, x3); \
++	x3 = vec_mergel(t2, x3); \
++      })
++
++#define QUARTERROUND2(a1,b1,c1,d1,a2,b2,c2,d2)			\
++	PLUS(a1,b1); PLUS(a2,b2); XOR(d1,a1); XOR(d2,a2);	\
++	    ROTATE(d1, rotate_16); ROTATE(d2, rotate_16);	\
++	PLUS(c1,d1); PLUS(c2,d2); XOR(b1,c1); XOR(b2,c2);	\
++	    ROTATE(b1, rotate_12); ROTATE(b2, rotate_12);	\
++	PLUS(a1,b1); PLUS(a2,b2); XOR(d1,a1); XOR(d2,a2);	\
++	    ROTATE(d1, rotate_8); ROTATE(d2, rotate_8);		\
++	PLUS(c1,d1); PLUS(c2,d2); XOR(b1,c1); XOR(b2,c2);	\
++	    ROTATE(b1, rotate_7); ROTATE(b2, rotate_7);
++
++unsigned int ASM_FUNC_ATTR
++_gcry_chacha20_ppc8_blocks4(u32 *state, byte *dst, const byte *src,
++			    size_t nblks)
++{
++  vector4x_u32 counters_0123 = { 0, 1, 2, 3 };
++  vector4x_u32 counter_4 = { 4, 0, 0, 0 };
++  vector4x_u32 rotate_16 = { 16, 16, 16, 16 };
++  vector4x_u32 rotate_12 = { 12, 12, 12, 12 };
++  vector4x_u32 rotate_8 = { 8, 8, 8, 8 };
++  vector4x_u32 rotate_7 = { 7, 7, 7, 7 };
++  vector4x_u32 state0, state1, state2, state3;
++  vector4x_u32 v0, v1, v2, v3, v4, v5, v6, v7;
++  vector4x_u32 v8, v9, v10, v11, v12, v13, v14, v15;
++  vector4x_u32 tmp;
++  int i;
++
++  /* force preload of constants to vector registers */
++  __asm__ ("": "+v" (counters_0123) :: "memory");
++  __asm__ ("": "+v" (counter_4) :: "memory");
++  __asm__ ("": "+v" (rotate_16) :: "memory");
++  __asm__ ("": "+v" (rotate_12) :: "memory");
++  __asm__ ("": "+v" (rotate_8) :: "memory");
++  __asm__ ("": "+v" (rotate_7) :: "memory");
++
++  state0 = vec_vsx_ld(0 * 16, state);
++  state1 = vec_vsx_ld(1 * 16, state);
++  state2 = vec_vsx_ld(2 * 16, state);
++  state3 = vec_vsx_ld(3 * 16, state);
++
++  do
++    {
++      v0 = vec_splat(state0, 0);
++      v1 = vec_splat(state0, 1);
++      v2 = vec_splat(state0, 2);
++      v3 = vec_splat(state0, 3);
++      v4 = vec_splat(state1, 0);
++      v5 = vec_splat(state1, 1);
++      v6 = vec_splat(state1, 2);
++      v7 = vec_splat(state1, 3);
++      v8 = vec_splat(state2, 0);
++      v9 = vec_splat(state2, 1);
++      v10 = vec_splat(state2, 2);
++      v11 = vec_splat(state2, 3);
++      v12 = vec_splat(state3, 0);
++      v13 = vec_splat(state3, 1);
++      v14 = vec_splat(state3, 2);
++      v15 = vec_splat(state3, 3);
++
++      v12 += counters_0123;
++      v13 -= vec_cmplt(v12, counters_0123);
++
++      for (i = 20; i > 0; i -= 2)
++	{
++	  QUARTERROUND2(v0, v4,  v8, v12,   v1, v5,  v9, v13)
++	  QUARTERROUND2(v2, v6, v10, v14,   v3, v7, v11, v15)
++	  QUARTERROUND2(v0, v5, v10, v15,   v1, v6, v11, v12)
++	  QUARTERROUND2(v2, v7,  v8, v13,   v3, v4,  v9, v14)
++	}
++
++      v0 += vec_splat(state0, 0);
++      v1 += vec_splat(state0, 1);
++      v2 += vec_splat(state0, 2);
++      v3 += vec_splat(state0, 3);
++      v4 += vec_splat(state1, 0);
++      v5 += vec_splat(state1, 1);
++      v6 += vec_splat(state1, 2);
++      v7 += vec_splat(state1, 3);
++      v8 += vec_splat(state2, 0);
++      v9 += vec_splat(state2, 1);
++      v10 += vec_splat(state2, 2);
++      v11 += vec_splat(state2, 3);
++      tmp = vec_splat(state3, 0);
++      tmp += counters_0123;
++      v12 += tmp;
++      v13 += vec_splat(state3, 1) - vec_cmplt(tmp, counters_0123);
++      v14 += vec_splat(state3, 2);
++      v15 += vec_splat(state3, 3);
++      ADD_U64(state3, counter_4); /* update counter */
++
++      transpose_4x4(v0, v1, v2, v3);
++      transpose_4x4(v4, v5, v6, v7);
++      transpose_4x4(v8, v9, v10, v11);
++      transpose_4x4(v12, v13, v14, v15);
++
++      v0 ^= vec_load_le((64 * 0 + 16 * 0), src);
++      v1 ^= vec_load_le((64 * 1 + 16 * 0), src);
++      v2 ^= vec_load_le((64 * 2 + 16 * 0), src);
++      v3 ^= vec_load_le((64 * 3 + 16 * 0), src);
++
++      v4 ^= vec_load_le((64 * 0 + 16 * 1), src);
++      v5 ^= vec_load_le((64 * 1 + 16 * 1), src);
++      v6 ^= vec_load_le((64 * 2 + 16 * 1), src);
++      v7 ^= vec_load_le((64 * 3 + 16 * 1), src);
++
++      v8 ^= vec_load_le((64 * 0 + 16 * 2), src);
++      v9 ^= vec_load_le((64 * 1 + 16 * 2), src);
++      v10 ^= vec_load_le((64 * 2 + 16 * 2), src);
++      v11 ^= vec_load_le((64 * 3 + 16 * 2), src);
++
++      v12 ^= vec_load_le((64 * 0 + 16 * 3), src);
++      v13 ^= vec_load_le((64 * 1 + 16 * 3), src);
++      v14 ^= vec_load_le((64 * 2 + 16 * 3), src);
++      v15 ^= vec_load_le((64 * 3 + 16 * 3), src);
++
++      vec_store_le(v0, (64 * 0 + 16 * 0), dst);
++      vec_store_le(v1, (64 * 1 + 16 * 0), dst);
++      vec_store_le(v2, (64 * 2 + 16 * 0), dst);
++      vec_store_le(v3, (64 * 3 + 16 * 0), dst);
++
++      vec_store_le(v4, (64 * 0 + 16 * 1), dst);
++      vec_store_le(v5, (64 * 1 + 16 * 1), dst);
++      vec_store_le(v6, (64 * 2 + 16 * 1), dst);
++      vec_store_le(v7, (64 * 3 + 16 * 1), dst);
++
++      vec_store_le(v8, (64 * 0 + 16 * 2), dst);
++      vec_store_le(v9, (64 * 1 + 16 * 2), dst);
++      vec_store_le(v10, (64 * 2 + 16 * 2), dst);
++      vec_store_le(v11, (64 * 3 + 16 * 2), dst);
++
++      vec_store_le(v12, (64 * 0 + 16 * 3), dst);
++      vec_store_le(v13, (64 * 1 + 16 * 3), dst);
++      vec_store_le(v14, (64 * 2 + 16 * 3), dst);
++      vec_store_le(v15, (64 * 3 + 16 * 3), dst);
++
++      src += 4*64;
++      dst += 4*64;
++
++      nblks -= 4;
++    }
++  while (nblks);
++
++  vec_vsx_st(state3, 3 * 16, state); /* store counter */
++
++  return 0;
++}
++
++
++#if SIZEOF_UNSIGNED_LONG == 8
++
++/**********************************************************************
++  4-way stitched chacha20-poly1305
++ **********************************************************************/
++
++#define ADD_1305_64(A2, A1, A0, B2, B1, B0) \
++      __asm__ ("addc %0, %3, %0\n" \
++	       "adde %1, %4, %1\n" \
++	       "adde %2, %5, %2\n" \
++	       : "+r" (A0), "+r" (A1), "+r" (A2) \
++	       : "r" (B0), "r" (B1), "r" (B2) \
++	       : "cc" )
++
++#define MUL_MOD_1305_64_PART1(H2, H1, H0, R1, R0, R1_MULT5) do { \
++    /* x = a * r (partial mod 2^130-5) */ \
++    umul_ppmm(x0_hi, x0_lo, H0, R0);  /* h0 * r0 */ \
++    umul_ppmm(x1_hi, x1_lo, H0, R1);  /* h0 * r1 */ \
++    \
++    umul_ppmm(t0_hi, t0_lo, H1, R1_MULT5); /* h1 * r1 mod 2^130-5 */ \
++  } while (0)
++
++#define MUL_MOD_1305_64_PART2(H2, H1, H0, R1, R0, R1_MULT5) do { \
++    add_ssaaaa(x0_hi, x0_lo, x0_hi, x0_lo, t0_hi, t0_lo); \
++    umul_ppmm(t1_hi, t1_lo, H1, R0);       /* h1 * r0 */ \
++    add_ssaaaa(x1_hi, x1_lo, x1_hi, x1_lo, t1_hi, t1_lo); \
++    \
++    t1_lo = H2 * R1_MULT5; /* h2 * r1 mod 2^130-5 */ \
++    t1_hi = H2 * R0;       /* h2 * r0 */ \
++    add_ssaaaa(H0, H1, x1_hi, x1_lo, t1_hi, t1_lo); \
++    \
++    /* carry propagation */ \
++    H2 = H0 & 3; \
++    H0 = (H0 >> 2) * 5; /* msb mod 2^130-5 */ \
++    ADD_1305_64(H2, H1, H0, (u64)0, x0_hi, x0_lo); \
++  } while (0)
++
++#define POLY1305_BLOCK_PART1(in_pos) do { \
++    m0 = buf_get_le64(poly1305_src + (in_pos) + 0); \
++    m1 = buf_get_le64(poly1305_src + (in_pos) + 8); \
++    /* a = h + m */ \
++    ADD_1305_64(h2, h1, h0, m2, m1, m0); \
++    /* h = a * r (partial mod 2^130-5) */ \
++    MUL_MOD_1305_64_PART1(h2, h1, h0, r1, r0, r1_mult5); \
++  } while (0)
++
++#define POLY1305_BLOCK_PART2(in_pos) do { \
++    MUL_MOD_1305_64_PART2(h2, h1, h0, r1, r0, r1_mult5); \
++  } while (0)
++
++unsigned int ASM_FUNC_ATTR
++_gcry_chacha20_poly1305_ppc8_blocks4(u32 *state, byte *dst, const byte *src,
++				     size_t nblks, POLY1305_STATE *st,
++				     const byte *poly1305_src)
++{
++  vector4x_u32 counters_0123 = { 0, 1, 2, 3 };
++  vector4x_u32 counter_4 = { 4, 0, 0, 0 };
++  vector4x_u32 rotate_16 = { 16, 16, 16, 16 };
++  vector4x_u32 rotate_12 = { 12, 12, 12, 12 };
++  vector4x_u32 rotate_8 = { 8, 8, 8, 8 };
++  vector4x_u32 rotate_7 = { 7, 7, 7, 7 };
++  vector4x_u32 state0, state1, state2, state3;
++  vector4x_u32 v0, v1, v2, v3, v4, v5, v6, v7;
++  vector4x_u32 v8, v9, v10, v11, v12, v13, v14, v15;
++  vector4x_u32 tmp;
++  u64 r0, r1, r1_mult5;
++  u64 h0, h1, h2;
++  u64 m0, m1, m2;
++  u64 x0_lo, x0_hi, x1_lo, x1_hi;
++  u64 t0_lo, t0_hi, t1_lo, t1_hi;
++  unsigned int i, o;
++
++  /* load poly1305 state */
++  m2 = 1;
++  h0 = st->h[0] + ((u64)st->h[1] << 32);
++  h1 = st->h[2] + ((u64)st->h[3] << 32);
++  h2 = st->h[4];
++  r0 = st->r[0] + ((u64)st->r[1] << 32);
++  r1 = st->r[2] + ((u64)st->r[3] << 32);
++  r1_mult5 = (r1 >> 2) + r1;
++
++  /* force preload of constants to vector registers */
++  __asm__ ("": "+v" (counters_0123) :: "memory");
++  __asm__ ("": "+v" (counter_4) :: "memory");
++  __asm__ ("": "+v" (rotate_16) :: "memory");
++  __asm__ ("": "+v" (rotate_12) :: "memory");
++  __asm__ ("": "+v" (rotate_8) :: "memory");
++  __asm__ ("": "+v" (rotate_7) :: "memory");
++
++  state0 = vec_vsx_ld(0 * 16, state);
++  state1 = vec_vsx_ld(1 * 16, state);
++  state2 = vec_vsx_ld(2 * 16, state);
++  state3 = vec_vsx_ld(3 * 16, state);
++
++  do
++    {
++      v0 = vec_splat(state0, 0);
++      v1 = vec_splat(state0, 1);
++      v2 = vec_splat(state0, 2);
++      v3 = vec_splat(state0, 3);
++      v4 = vec_splat(state1, 0);
++      v5 = vec_splat(state1, 1);
++      v6 = vec_splat(state1, 2);
++      v7 = vec_splat(state1, 3);
++      v8 = vec_splat(state2, 0);
++      v9 = vec_splat(state2, 1);
++      v10 = vec_splat(state2, 2);
++      v11 = vec_splat(state2, 3);
++      v12 = vec_splat(state3, 0);
++      v13 = vec_splat(state3, 1);
++      v14 = vec_splat(state3, 2);
++      v15 = vec_splat(state3, 3);
++
++      v12 += counters_0123;
++      v13 -= vec_cmplt(v12, counters_0123);
++
++      for (o = 20; o; o -= 10)
++	{
++	  for (i = 8; i; i -= 2)
++	    {
++	      POLY1305_BLOCK_PART1(0 * 16);
++	      QUARTERROUND2(v0, v4,  v8, v12,   v1, v5,  v9, v13)
++	      POLY1305_BLOCK_PART2();
++	      QUARTERROUND2(v2, v6, v10, v14,   v3, v7, v11, v15)
++	      POLY1305_BLOCK_PART1(1 * 16);
++	      poly1305_src += 2 * 16;
++	      QUARTERROUND2(v0, v5, v10, v15,   v1, v6, v11, v12)
++	      POLY1305_BLOCK_PART2();
++	      QUARTERROUND2(v2, v7,  v8, v13,   v3, v4,  v9, v14)
++	    }
++
++	  QUARTERROUND2(v0, v4,  v8, v12,   v1, v5,  v9, v13)
++	  QUARTERROUND2(v2, v6, v10, v14,   v3, v7, v11, v15)
++	  QUARTERROUND2(v0, v5, v10, v15,   v1, v6, v11, v12)
++	  QUARTERROUND2(v2, v7,  v8, v13,   v3, v4,  v9, v14)
++	}
++
++      v0 += vec_splat(state0, 0);
++      v1 += vec_splat(state0, 1);
++      v2 += vec_splat(state0, 2);
++      v3 += vec_splat(state0, 3);
++      v4 += vec_splat(state1, 0);
++      v5 += vec_splat(state1, 1);
++      v6 += vec_splat(state1, 2);
++      v7 += vec_splat(state1, 3);
++      v8 += vec_splat(state2, 0);
++      v9 += vec_splat(state2, 1);
++      v10 += vec_splat(state2, 2);
++      v11 += vec_splat(state2, 3);
++      tmp = vec_splat(state3, 0);
++      tmp += counters_0123;
++      v12 += tmp;
++      v13 += vec_splat(state3, 1) - vec_cmplt(tmp, counters_0123);
++      v14 += vec_splat(state3, 2);
++      v15 += vec_splat(state3, 3);
++      ADD_U64(state3, counter_4); /* update counter */
++
++      transpose_4x4(v0, v1, v2, v3);
++      transpose_4x4(v4, v5, v6, v7);
++      transpose_4x4(v8, v9, v10, v11);
++      transpose_4x4(v12, v13, v14, v15);
++
++      v0 ^= vec_load_le((64 * 0 + 16 * 0), src);
++      v1 ^= vec_load_le((64 * 1 + 16 * 0), src);
++      v2 ^= vec_load_le((64 * 2 + 16 * 0), src);
++      v3 ^= vec_load_le((64 * 3 + 16 * 0), src);
++
++      v4 ^= vec_load_le((64 * 0 + 16 * 1), src);
++      v5 ^= vec_load_le((64 * 1 + 16 * 1), src);
++      v6 ^= vec_load_le((64 * 2 + 16 * 1), src);
++      v7 ^= vec_load_le((64 * 3 + 16 * 1), src);
++
++      v8 ^= vec_load_le((64 * 0 + 16 * 2), src);
++      v9 ^= vec_load_le((64 * 1 + 16 * 2), src);
++      v10 ^= vec_load_le((64 * 2 + 16 * 2), src);
++      v11 ^= vec_load_le((64 * 3 + 16 * 2), src);
++
++      v12 ^= vec_load_le((64 * 0 + 16 * 3), src);
++      v13 ^= vec_load_le((64 * 1 + 16 * 3), src);
++      v14 ^= vec_load_le((64 * 2 + 16 * 3), src);
++      v15 ^= vec_load_le((64 * 3 + 16 * 3), src);
++
++      vec_store_le(v0, (64 * 0 + 16 * 0), dst);
++      vec_store_le(v1, (64 * 1 + 16 * 0), dst);
++      vec_store_le(v2, (64 * 2 + 16 * 0), dst);
++      vec_store_le(v3, (64 * 3 + 16 * 0), dst);
++
++      vec_store_le(v4, (64 * 0 + 16 * 1), dst);
++      vec_store_le(v5, (64 * 1 + 16 * 1), dst);
++      vec_store_le(v6, (64 * 2 + 16 * 1), dst);
++      vec_store_le(v7, (64 * 3 + 16 * 1), dst);
++
++      vec_store_le(v8, (64 * 0 + 16 * 2), dst);
++      vec_store_le(v9, (64 * 1 + 16 * 2), dst);
++      vec_store_le(v10, (64 * 2 + 16 * 2), dst);
++      vec_store_le(v11, (64 * 3 + 16 * 2), dst);
++
++      vec_store_le(v12, (64 * 0 + 16 * 3), dst);
++      vec_store_le(v13, (64 * 1 + 16 * 3), dst);
++      vec_store_le(v14, (64 * 2 + 16 * 3), dst);
++      vec_store_le(v15, (64 * 3 + 16 * 3), dst);
++
++      src += 4*64;
++      dst += 4*64;
++
++      nblks -= 4;
++    }
++  while (nblks);
++
++  vec_vsx_st(state3, 3 * 16, state); /* store counter */
++
++  /* store poly1305 state */
++  st->h[0] = h0;
++  st->h[1] = h0 >> 32;
++  st->h[2] = h1;
++  st->h[3] = h1 >> 32;
++  st->h[4] = h2;
++
++  return 0;
++}
++
++#endif /* SIZEOF_UNSIGNED_LONG == 8 */
++
++#endif /* ENABLE_PPC_CRYPTO_SUPPORT */
+diff --git a/cipher/chacha20.c b/cipher/chacha20.c
+index ebbfeb24..8eefba7d 100644
+--- a/cipher/chacha20.c
++++ b/cipher/chacha20.c
+@@ -31,6 +31,11 @@
+ 
+ 
+ #include <config.h>
++
++#if !defined(ENABLE_PPC_CRYPTO_SUPPORT) || \
++    !defined(HAVE_COMPATIBLE_CC_PPC_ALTIVEC) || \
++    !defined(HAVE_GCC_INLINE_ASM_PPC_ALTIVEC)
++
+ #include <stdio.h>
+ #include <stdlib.h>
+ #include <string.h>
+@@ -637,3 +642,5 @@ gcry_cipher_spec_t _gcry_cipher_spec_chacha20 = {
+   NULL,
+   chacha20_setiv
+ };
++
++#endif /* ENABLE_PPC_CRYPTO_SUPPORT */
+diff --git a/cipher/cipher-internal.h b/cipher/cipher-internal.h
+index a5fd3097..cd45e0a5 100644
+--- a/cipher/cipher-internal.h
++++ b/cipher/cipher-internal.h
+@@ -20,8 +20,15 @@
+ #ifndef G10_CIPHER_INTERNAL_H
+ #define G10_CIPHER_INTERNAL_H
+ 
++#if defined(ENABLE_PPC_CRYPTO_SUPPORT) && \
++    defined(HAVE_COMPATIBLE_CC_PPC_ALTIVEC) && \
++    defined(HAVE_GCC_INLINE_ASM_PPC_ALTIVEC) && \
++    defined(USE_CHACHA20) && \
++    __GNUC__ >= 4
++#include "./poly1305-internal-new.h"
++#else
+ #include "./poly1305-internal.h"
+-
++#endif /* ENABLE_PPC_CRYPTO_SUPPORT */
+ 
+ /* The maximum supported size of a block in bytes.  */
+ #define MAX_BLOCKSIZE 16
+diff --git a/cipher/mpi-new/mpi-asm-defs.h b/cipher/mpi-new/mpi-asm-defs.h
+new file mode 100644
+index 00000000..e607806e
+--- /dev/null
++++ b/cipher/mpi-new/mpi-asm-defs.h
+@@ -0,0 +1,8 @@
++/* This file defines some basic constants for the MPI machinery.
++ * AMD64 compiled for the x32 ABI is special and thus we can't use the
++ * standard values for this ABI.  */
++#if __GNUC__ >= 3 && defined(__x86_64__) && defined(__ILP32__)
++#define BYTES_PER_MPI_LIMB 8
++#else
++#define BYTES_PER_MPI_LIMB  (SIZEOF_UNSIGNED_LONG)
++#endif
+diff --git a/cipher/mpi-new/mpi-inline.h b/cipher/mpi-new/mpi-inline.h
+new file mode 100644
+index 00000000..94e2aec8
+--- /dev/null
++++ b/cipher/mpi-new/mpi-inline.h
+@@ -0,0 +1,161 @@
++/* mpi-inline.h  -  Internal to the Multi Precision Integers
++ * Copyright (C) 1994, 1996, 1998, 1999,
++ *               2001, 2002 Free Software Foundation, Inc.
++ *
++ * This file is part of Libgcrypt.
++ *
++ * Libgcrypt is free software; you can redistribute it and/or modify
++ * it under the terms of the GNU Lesser General Public License as
++ * published by the Free Software Foundation; either version 2.1 of
++ * the License, or (at your option) any later version.
++ *
++ * Libgcrypt is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++ * GNU Lesser General Public License for more details.
++ *
++ * You should have received a copy of the GNU Lesser General Public
++ * License along with this program; if not, write to the Free Software
++ * Foundation, Inc., 59 Temple Place - Suite 330, Boston, MA 02111-1307, USA
++ *
++ * Note: This code is heavily based on the GNU MP Library.
++ *	 Actually it's the same code with only minor changes in the
++ *	 way the data is stored; this is to support the abstraction
++ *	 of an optional secure memory allocation which may be used
++ *	 to avoid revealing of sensitive data due to paging etc.
++ */
++
++#ifndef G10_MPI_INLINE_H
++#define G10_MPI_INLINE_H
++
++/* Starting with gcc 4.3 "extern inline" conforms in c99 mode to the
++   c99 semantics.  To keep the useful old semantics we use an
++   attribute.  */
++#ifndef G10_MPI_INLINE_DECL
++# ifdef __GNUC_STDC_INLINE__
++#  define G10_MPI_INLINE_DECL  extern inline __attribute__ ((__gnu_inline__))
++# else
++#  define G10_MPI_INLINE_DECL  extern __inline__
++# endif
++#endif
++
++G10_MPI_INLINE_DECL  mpi_limb_t
++_gcry_mpih_add_1( mpi_ptr_t res_ptr, mpi_ptr_t s1_ptr,
++	       mpi_size_t s1_size, mpi_limb_t s2_limb)
++{
++    mpi_limb_t x;
++
++    x = *s1_ptr++;
++    s2_limb += x;
++    *res_ptr++ = s2_limb;
++    if( s2_limb < x ) { /* sum is less than the left operand: handle carry */
++	while( --s1_size ) {
++	    x = *s1_ptr++ + 1;	/* add carry */
++	    *res_ptr++ = x;	/* and store */
++	    if( x )		/* not 0 (no overflow): we can stop */
++		goto leave;
++	}
++	return 1; /* return carry (size of s1 to small) */
++    }
++
++  leave:
++    if( res_ptr != s1_ptr ) { /* not the same variable */
++	mpi_size_t i;	       /* copy the rest */
++	for( i=0; i < s1_size-1; i++ )
++	    res_ptr[i] = s1_ptr[i];
++    }
++    return 0; /* no carry */
++}
++
++
++
++G10_MPI_INLINE_DECL mpi_limb_t
++_gcry_mpih_add(mpi_ptr_t res_ptr, mpi_ptr_t s1_ptr, mpi_size_t s1_size,
++			       mpi_ptr_t s2_ptr, mpi_size_t s2_size)
++{
++    mpi_limb_t cy = 0;
++
++    if( s2_size )
++	cy = _gcry_mpih_add_n( res_ptr, s1_ptr, s2_ptr, s2_size );
++
++    if( s1_size - s2_size )
++	cy = _gcry_mpih_add_1( res_ptr + s2_size, s1_ptr + s2_size,
++			    s1_size - s2_size, cy);
++    return cy;
++}
++
++
++G10_MPI_INLINE_DECL mpi_limb_t
++_gcry_mpih_sub_1(mpi_ptr_t res_ptr,  mpi_ptr_t s1_ptr,
++	      mpi_size_t s1_size, mpi_limb_t s2_limb )
++{
++    mpi_limb_t x;
++
++    x = *s1_ptr++;
++    s2_limb = x - s2_limb;
++    *res_ptr++ = s2_limb;
++    if( s2_limb > x ) {
++	while( --s1_size ) {
++	    x = *s1_ptr++;
++	    *res_ptr++ = x - 1;
++	    if( x )
++		goto leave;
++	}
++	return 1;
++    }
++
++  leave:
++    if( res_ptr != s1_ptr ) {
++	mpi_size_t i;
++	for( i=0; i < s1_size-1; i++ )
++	    res_ptr[i] = s1_ptr[i];
++    }
++    return 0;
++}
++
++
++
++G10_MPI_INLINE_DECL   mpi_limb_t
++_gcry_mpih_sub( mpi_ptr_t res_ptr, mpi_ptr_t s1_ptr, mpi_size_t s1_size,
++				mpi_ptr_t s2_ptr, mpi_size_t s2_size)
++{
++    mpi_limb_t cy = 0;
++
++    if( s2_size )
++	cy = _gcry_mpih_sub_n(res_ptr, s1_ptr, s2_ptr, s2_size);
++
++    if( s1_size - s2_size )
++	cy = _gcry_mpih_sub_1(res_ptr + s2_size, s1_ptr + s2_size,
++				      s1_size - s2_size, cy);
++    return cy;
++}
++
++/****************
++ * Compare OP1_PTR/OP1_SIZE with OP2_PTR/OP2_SIZE.
++ * There are no restrictions on the relative sizes of
++ * the two arguments.
++ * Return 1 if OP1 > OP2, 0 if they are equal, and -1 if OP1 < OP2.
++ */
++G10_MPI_INLINE_DECL int
++_gcry_mpih_cmp( mpi_ptr_t op1_ptr, mpi_ptr_t op2_ptr, mpi_size_t size )
++{
++    mpi_size_t i;
++    mpi_limb_t op1_word, op2_word;
++
++    for( i = size - 1; i >= 0 ; i--) {
++	op1_word = op1_ptr[i];
++	op2_word = op2_ptr[i];
++	if( op1_word != op2_word )
++	    goto diff;
++    }
++    return 0;
++
++  diff:
++    /* This can *not* be simplified to
++     *	 op2_word - op2_word
++     * since that expression might give signed overflow.  */
++    return (op1_word > op2_word) ? 1 : -1;
++}
++
++
++#endif /*G10_MPI_INLINE_H*/
+diff --git a/cipher/mpi-new/mpi-internal.h b/cipher/mpi-new/mpi-internal.h
+new file mode 100644
+index 00000000..11fcbde4
+--- /dev/null
++++ b/cipher/mpi-new/mpi-internal.h
+@@ -0,0 +1,305 @@
++/* mpi-internal.h  -  Internal to the Multi Precision Integers
++ * Copyright (C) 1994, 1996, 1998, 2000, 2002,
++ *               2003 Free Software Foundation, Inc.
++ *
++ * This file is part of Libgcrypt.
++ *
++ * Libgcrypt is free software; you can redistribute it and/or modify
++ * it under the terms of the GNU Lesser General Public License as
++ * published by the Free Software Foundation; either version 2.1 of
++ * the License, or (at your option) any later version.
++ *
++ * Libgcrypt is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++ * GNU Lesser General Public License for more details.
++ *
++ * You should have received a copy of the GNU Lesser General Public
++ * License along with this program; if not, write to the Free Software
++ * Foundation, Inc., 59 Temple Place - Suite 330, Boston, MA 02111-1307, USA
++ *
++ * Note: This code is heavily based on the GNU MP Library.
++ *	 Actually it's the same code with only minor changes in the
++ *	 way the data is stored; this is to support the abstraction
++ *	 of an optional secure memory allocation which may be used
++ *	 to avoid revealing of sensitive data due to paging etc.
++ */
++
++#ifndef G10_MPI_INTERNAL_H
++#define G10_MPI_INTERNAL_H
++
++#include "mpi-asm-defs.h"
++
++#ifndef BITS_PER_MPI_LIMB
++#if BYTES_PER_MPI_LIMB == SIZEOF_UNSIGNED_INT
++  typedef unsigned int mpi_limb_t;
++  typedef   signed int mpi_limb_signed_t;
++#elif BYTES_PER_MPI_LIMB == SIZEOF_UNSIGNED_LONG
++  typedef unsigned long int mpi_limb_t;
++  typedef   signed long int mpi_limb_signed_t;
++#elif BYTES_PER_MPI_LIMB == SIZEOF_UNSIGNED_LONG_LONG
++  typedef unsigned long long int mpi_limb_t;
++  typedef   signed long long int mpi_limb_signed_t;
++#elif BYTES_PER_MPI_LIMB == SIZEOF_UNSIGNED_SHORT
++  typedef unsigned short int mpi_limb_t;
++  typedef   signed short int mpi_limb_signed_t;
++#else
++#error BYTES_PER_MPI_LIMB does not match any C type
++#endif
++#define BITS_PER_MPI_LIMB    (8*BYTES_PER_MPI_LIMB)
++#endif /*BITS_PER_MPI_LIMB*/
++
++#include "mpi.h"
++
++/* If KARATSUBA_THRESHOLD is not already defined, define it to a
++ * value which is good on most machines.  */
++
++/* tested 4, 16, 32 and 64, where 16 gave the best performance when
++ * checking a 768 and a 1024 bit ElGamal signature.
++ * (wk 22.12.97) */
++#ifndef KARATSUBA_THRESHOLD
++#define KARATSUBA_THRESHOLD 16
++#endif
++
++/* The code can't handle KARATSUBA_THRESHOLD smaller than 2.  */
++#if KARATSUBA_THRESHOLD < 2
++#undef KARATSUBA_THRESHOLD
++#define KARATSUBA_THRESHOLD 2
++#endif
++
++
++typedef mpi_limb_t *mpi_ptr_t; /* pointer to a limb */
++typedef int mpi_size_t;        /* (must be a signed type) */
++
++#define ABS(x) (x >= 0 ? x : -x)
++#define MIN(l,o) ((l) < (o) ? (l) : (o))
++#define MAX(h,i) ((h) > (i) ? (h) : (i))
++#define RESIZE_IF_NEEDED(a,b) \
++    do {			   \
++	if( (a)->alloced < (b) )   \
++	    mpi_resize((a), (b));  \
++    } while(0)
++#define RESIZE_AND_CLEAR_IF_NEEDED(a,b) \
++    do {			   \
++	if( (a)->nlimbs < (b) )   \
++	    mpi_resize((a), (b));  \
++    } while(0)
++
++/* Copy N limbs from S to D.  */
++#define MPN_COPY( d, s, n) \
++    do {				\
++	mpi_size_t _i;			\
++	for( _i = 0; _i < (n); _i++ )	\
++	    (d)[_i] = (s)[_i];		\
++    } while(0)
++
++#define MPN_COPY_INCR( d, s, n) 	\
++    do {				\
++	mpi_size_t _i;			\
++	for( _i = 0; _i < (n); _i++ )	\
++	    (d)[_i] = (s)[_i];		\
++    } while (0)
++
++#define MPN_COPY_DECR( d, s, n ) \
++    do {				\
++	mpi_size_t _i;			\
++	for( _i = (n)-1; _i >= 0; _i--) \
++	   (d)[_i] = (s)[_i];		\
++    } while(0)
++
++/* Zero N limbs at D */
++#define MPN_ZERO(d, n) \
++    do {				  \
++	int  _i;			  \
++	for( _i = 0; _i < (n); _i++ )  \
++	    (d)[_i] = 0;		    \
++    } while (0)
++
++#define MPN_NORMALIZE(d, n)  \
++    do {		       \
++	while( (n) > 0 ) {     \
++	    if( (d)[(n)-1] ) \
++		break;	       \
++	    (n)--;	       \
++	}		       \
++    } while(0)
++
++#define MPN_NORMALIZE_NOT_ZERO(d, n) \
++    do {				    \
++	for(;;) {			    \
++	    if( (d)[(n)-1] )		    \
++		break;			    \
++	    (n)--;			    \
++	}				    \
++    } while(0)
++
++#define MPN_MUL_N_RECURSE(prodp, up, vp, size, tspace) \
++    do {						\
++	if( (size) < KARATSUBA_THRESHOLD )		\
++	    mul_n_basecase (prodp, up, vp, size);	\
++	else						\
++	    mul_n (prodp, up, vp, size, tspace);	\
++    } while (0);
++
++
++/* Divide the two-limb number in (NH,,NL) by D, with DI being the largest
++ * limb not larger than (2**(2*BITS_PER_MP_LIMB))/D - (2**BITS_PER_MP_LIMB).
++ * If this would yield overflow, DI should be the largest possible number
++ * (i.e., only ones).  For correct operation, the most significant bit of D
++ * has to be set.  Put the quotient in Q and the remainder in R.
++ */
++#define UDIV_QRNND_PREINV(q, r, nh, nl, d, di) \
++    do {							    \
++        mpi_limb_t _ql GCC_ATTR_UNUSED;                               \
++	mpi_limb_t _q, _r;                                          \
++	mpi_limb_t _xh, _xl;					    \
++	umul_ppmm (_q, _ql, (nh), (di));			    \
++	_q += (nh);	/* DI is 2**BITS_PER_MPI_LIMB too small */  \
++	umul_ppmm (_xh, _xl, _q, (d));				    \
++	sub_ddmmss (_xh, _r, (nh), (nl), _xh, _xl);		    \
++	if( _xh ) {						    \
++	    sub_ddmmss (_xh, _r, _xh, _r, 0, (d));		    \
++	    _q++;						    \
++	    if( _xh) {						    \
++		sub_ddmmss (_xh, _r, _xh, _r, 0, (d));		    \
++		_q++;						    \
++	    }							    \
++	}							    \
++	if( _r >= (d) ) {					    \
++	    _r -= (d);						    \
++	    _q++;						    \
++	}							    \
++	(r) = _r;						    \
++	(q) = _q;						    \
++    } while (0)
++
++
++/*-- mpiutil.c --*/
++#define mpi_alloc_limb_space(n,f)  _gcry_mpi_alloc_limb_space((n),(f))
++mpi_ptr_t _gcry_mpi_alloc_limb_space( unsigned nlimbs, int sec );
++void _gcry_mpi_free_limb_space( mpi_ptr_t a, unsigned int nlimbs );
++void _gcry_mpi_assign_limb_space( gcry_mpi_t a, mpi_ptr_t ap, unsigned nlimbs );
++
++/*-- mpi-bit.c --*/
++#define mpi_rshift_limbs(a,n)  _gcry_mpi_rshift_limbs ((a), (n))
++#define mpi_lshift_limbs(a,n)  _gcry_mpi_lshift_limbs ((a), (n))
++
++void _gcry_mpi_rshift_limbs( gcry_mpi_t a, unsigned int count );
++void _gcry_mpi_lshift_limbs( gcry_mpi_t a, unsigned int count );
++
++
++/*-- mpih-add.c --*/
++mpi_limb_t _gcry_mpih_add_1(mpi_ptr_t res_ptr,  mpi_ptr_t s1_ptr,
++			 mpi_size_t s1_size, mpi_limb_t s2_limb );
++mpi_limb_t _gcry_mpih_add_n( mpi_ptr_t res_ptr, mpi_ptr_t s1_ptr,
++			  mpi_ptr_t s2_ptr,  mpi_size_t size);
++mpi_limb_t _gcry_mpih_add(mpi_ptr_t res_ptr, mpi_ptr_t s1_ptr, mpi_size_t s1_size,
++		       mpi_ptr_t s2_ptr, mpi_size_t s2_size);
++
++/*-- mpih-sub.c --*/
++mpi_limb_t _gcry_mpih_sub_1( mpi_ptr_t res_ptr,  mpi_ptr_t s1_ptr,
++			  mpi_size_t s1_size, mpi_limb_t s2_limb );
++mpi_limb_t _gcry_mpih_sub_n( mpi_ptr_t res_ptr, mpi_ptr_t s1_ptr,
++			  mpi_ptr_t s2_ptr, mpi_size_t size);
++mpi_limb_t _gcry_mpih_sub(mpi_ptr_t res_ptr, mpi_ptr_t s1_ptr, mpi_size_t s1_size,
++		       mpi_ptr_t s2_ptr, mpi_size_t s2_size);
++
++/*-- mpih-cmp.c --*/
++int _gcry_mpih_cmp( mpi_ptr_t op1_ptr, mpi_ptr_t op2_ptr, mpi_size_t size );
++
++/*-- mpih-mul.c --*/
++
++struct karatsuba_ctx {
++    struct karatsuba_ctx *next;
++    mpi_ptr_t tspace;
++    unsigned int tspace_nlimbs;
++    mpi_size_t tspace_size;
++    mpi_ptr_t tp;
++    unsigned int tp_nlimbs;
++    mpi_size_t tp_size;
++};
++
++void _gcry_mpih_release_karatsuba_ctx( struct karatsuba_ctx *ctx );
++
++mpi_limb_t _gcry_mpih_addmul_1( mpi_ptr_t res_ptr, mpi_ptr_t s1_ptr,
++			     mpi_size_t s1_size, mpi_limb_t s2_limb);
++mpi_limb_t _gcry_mpih_submul_1( mpi_ptr_t res_ptr, mpi_ptr_t s1_ptr,
++			     mpi_size_t s1_size, mpi_limb_t s2_limb);
++void _gcry_mpih_mul_n( mpi_ptr_t prodp, mpi_ptr_t up, mpi_ptr_t vp,
++						   mpi_size_t size);
++mpi_limb_t _gcry_mpih_mul( mpi_ptr_t prodp, mpi_ptr_t up, mpi_size_t usize,
++					 mpi_ptr_t vp, mpi_size_t vsize);
++void _gcry_mpih_sqr_n_basecase( mpi_ptr_t prodp, mpi_ptr_t up, mpi_size_t size );
++void _gcry_mpih_sqr_n( mpi_ptr_t prodp, mpi_ptr_t up, mpi_size_t size,
++						mpi_ptr_t tspace);
++
++void _gcry_mpih_mul_karatsuba_case( mpi_ptr_t prodp,
++				 mpi_ptr_t up, mpi_size_t usize,
++				 mpi_ptr_t vp, mpi_size_t vsize,
++				 struct karatsuba_ctx *ctx );
++
++
++/*-- mpih-mul_1.c (or xxx/cpu/ *.S) --*/
++mpi_limb_t _gcry_mpih_mul_1( mpi_ptr_t res_ptr, mpi_ptr_t s1_ptr,
++			  mpi_size_t s1_size, mpi_limb_t s2_limb);
++
++/*-- mpih-div.c --*/
++mpi_limb_t _gcry_mpih_mod_1(mpi_ptr_t dividend_ptr, mpi_size_t dividend_size,
++						 mpi_limb_t divisor_limb);
++mpi_limb_t _gcry_mpih_divrem( mpi_ptr_t qp, mpi_size_t qextra_limbs,
++			   mpi_ptr_t np, mpi_size_t nsize,
++			   mpi_ptr_t dp, mpi_size_t dsize);
++mpi_limb_t _gcry_mpih_divmod_1( mpi_ptr_t quot_ptr,
++			     mpi_ptr_t dividend_ptr, mpi_size_t dividend_size,
++			     mpi_limb_t divisor_limb);
++
++/*-- mpih-shift.c --*/
++mpi_limb_t _gcry_mpih_lshift( mpi_ptr_t wp, mpi_ptr_t up, mpi_size_t usize,
++							   unsigned cnt);
++mpi_limb_t _gcry_mpih_rshift( mpi_ptr_t wp, mpi_ptr_t up, mpi_size_t usize,
++							   unsigned cnt);
++
++/*-- mpih-const-time.c --*/
++#define mpih_set_cond(w,u,s,o) _gcry_mpih_set_cond ((w),(u),(s),(o))
++#define mpih_add_n_cond(w,u,v,s,o) _gcry_mpih_add_n_cond ((w),(u),(v),(s),(o))
++#define mpih_sub_n_cond(w,u,v,s,o) _gcry_mpih_sub_n_cond ((w),(u),(v),(s),(o))
++#define mpih_swap_cond(u,v,s,o) _gcry_mpih_swap_cond ((u),(v),(s),(o))
++#define mpih_abs_cond(w,u,s,o) _gcry_mpih_abs_cond ((w),(u),(s),(o))
++#define mpih_mod(v,vs,u,us) _gcry_mpih_mod ((v),(vs),(u),(us))
++
++void _gcry_mpih_set_cond (mpi_ptr_t wp, mpi_ptr_t up, mpi_size_t usize,
++                          unsigned long op_enable);
++mpi_limb_t _gcry_mpih_add_n_cond (mpi_ptr_t wp, mpi_ptr_t up, mpi_ptr_t vp,
++                                  mpi_size_t usize, unsigned long op_enable);
++mpi_limb_t _gcry_mpih_sub_n_cond (mpi_ptr_t wp, mpi_ptr_t up, mpi_ptr_t vp,
++                                  mpi_size_t usize, unsigned long op_enable);
++void _gcry_mpih_swap_cond (mpi_ptr_t up, mpi_ptr_t vp, mpi_size_t usize,
++                           unsigned long op_enable);
++void _gcry_mpih_abs_cond (mpi_ptr_t wp, mpi_ptr_t up,
++                          mpi_size_t usize, unsigned long op_enable);
++mpi_ptr_t _gcry_mpih_mod (mpi_ptr_t vp, mpi_size_t vsize,
++                          mpi_ptr_t up, mpi_size_t usize);
++int _gcry_mpih_cmp_ui (mpi_ptr_t up, mpi_size_t usize, unsigned long v);
++
++
++/* Define stuff for longlong.h.  */
++#define W_TYPE_SIZE BITS_PER_MPI_LIMB
++  typedef mpi_limb_t   UWtype;
++  typedef unsigned int UHWtype;
++#if defined (__GNUC__)
++  typedef unsigned int UQItype	  __attribute__ ((mode (QI)));
++  typedef	   int SItype	  __attribute__ ((mode (SI)));
++  typedef unsigned int USItype	  __attribute__ ((mode (SI)));
++  typedef	   int DItype	  __attribute__ ((mode (DI)));
++  typedef unsigned int UDItype	  __attribute__ ((mode (DI)));
++#else
++  typedef unsigned char UQItype;
++  typedef	   long SItype;
++  typedef unsigned long USItype;
++#endif
++
++#ifdef __GNUC__
++#include "mpi-inline.h"
++#endif
++
++#endif /*G10_MPI_INTERNAL_H*/
+diff --git a/cipher/poly1305-new.c b/cipher/poly1305-new.c
+new file mode 100644
+index 00000000..56a1a56e
+--- /dev/null
++++ b/cipher/poly1305-new.c
+@@ -0,0 +1,749 @@
++/* poly1305.c  -  Poly1305 internals and generic implementation
++ * Copyright (C) 2014,2017,2018 Jussi Kivilinna <jussi.kivilinna@iki.fi>
++ *
++ * This file is part of Libgcrypt.
++ *
++ * Libgcrypt is free software; you can redistribute it and/or modify
++ * it under the terms of the GNU Lesser general Public License as
++ * published by the Free Software Foundation; either version 2.1 of
++ * the License, or (at your option) any later version.
++ *
++ * Libgcrypt is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++ * GNU Lesser General Public License for more details.
++ *
++ * You should have received a copy of the GNU Lesser General Public
++ * License along with this program; if not, see <http://www.gnu.org/licenses/>.
++ */
++
++#include <config.h>
++
++#if defined(ENABLE_PPC_CRYPTO_SUPPORT) && \
++    defined(HAVE_COMPATIBLE_CC_PPC_ALTIVEC) && \
++    defined(HAVE_GCC_INLINE_ASM_PPC_ALTIVEC) && \
++    defined(USE_CHACHA20) && \
++    __GNUC__ >= 4
++
++#include <stdio.h>
++#include <stdlib.h>
++#include <string.h>
++
++#include "types.h"
++#include "g10lib.h"
++#include "cipher.h"
++#include "bufhelp.h"
++#include "poly1305-internal-new.h"
++
++#include "mpi-new/mpi-internal.h"
++#include "mpi/longlong.h"
++
++
++static const char *selftest (void);
++
++
++#undef HAVE_ASM_POLY1305_BLOCKS
++
++#undef USE_MPI_64BIT
++#undef USE_MPI_32BIT
++#if BYTES_PER_MPI_LIMB == 8 // && defined(HAVE_TYPE_U64)  removed: added in types.h, can be assumed
++# define USE_MPI_64BIT 1
++#elif BYTES_PER_MPI_LIMB == 4
++# define USE_MPI_32BIT 1
++#else
++# error please implement for this limb size.
++#endif
++
++
++/* USE_S390X_ASM indicates whether to enable zSeries code. */
++#undef USE_S390X_ASM
++#if BYTES_PER_MPI_LIMB == 8
++# if defined (__s390x__) && __GNUC__ >= 4 && __ARCH__ >= 9
++#  if defined(HAVE_GCC_INLINE_ASM_S390X)
++#   define USE_S390X_ASM 1
++#  endif /* USE_S390X_ASM */
++# endif
++#endif
++
++
++#ifdef USE_S390X_ASM
++
++#define HAVE_ASM_POLY1305_BLOCKS 1
++
++extern unsigned int _gcry_poly1305_s390x_blocks1(void *state,
++						 const byte *buf, size_t len,
++						 byte high_pad);
++
++static unsigned int
++poly1305_blocks (poly1305_context_t *ctx, const byte *buf, size_t len,
++		 byte high_pad)
++{
++  return _gcry_poly1305_s390x_blocks1(&ctx->state, buf, len, high_pad);
++}
++
++#endif /* USE_S390X_ASM */
++
++
++static void poly1305_init (poly1305_context_t *ctx,
++			   const byte key[POLY1305_KEYLEN])
++{
++  POLY1305_STATE *st = &ctx->state;
++
++  ctx->leftover = 0;
++
++  st->h[0] = 0;
++  st->h[1] = 0;
++  st->h[2] = 0;
++  st->h[3] = 0;
++  st->h[4] = 0;
++
++  st->r[0] = buf_get_le32(key + 0)  & 0x0fffffff;
++  st->r[1] = buf_get_le32(key + 4)  & 0x0ffffffc;
++  st->r[2] = buf_get_le32(key + 8)  & 0x0ffffffc;
++  st->r[3] = buf_get_le32(key + 12) & 0x0ffffffc;
++
++  st->k[0] = buf_get_le32(key + 16);
++  st->k[1] = buf_get_le32(key + 20);
++  st->k[2] = buf_get_le32(key + 24);
++  st->k[3] = buf_get_le32(key + 28);
++}
++
++
++#ifdef USE_MPI_64BIT
++
++#if defined (__aarch64__) && defined(HAVE_CPU_ARCH_ARM) && __GNUC__ >= 4
++
++/* A += B (armv8/aarch64) */
++#define ADD_1305_64(A2, A1, A0, B2, B1, B0) \
++      __asm__ ("adds %0, %3, %0\n" \
++	       "adcs %1, %4, %1\n" \
++	       "adc  %2, %5, %2\n" \
++	       : "+r" (A0), "+r" (A1), "+r" (A2) \
++	       : "r" (B0), "r" (B1), "r" (B2) \
++	       : "cc" )
++
++#endif /* __aarch64__ */
++
++#if defined (__x86_64__) && defined(HAVE_CPU_ARCH_X86) && __GNUC__ >= 4
++
++/* A += B (x86-64) */
++#define ADD_1305_64(A2, A1, A0, B2, B1, B0) \
++      __asm__ ("addq %3, %0\n" \
++	       "adcq %4, %1\n" \
++	       "adcq %5, %2\n" \
++	       : "+r" (A0), "+r" (A1), "+r" (A2) \
++	       : "g" (B0), "g" (B1), "g" (B2) \
++	       : "cc" )
++
++#endif /* __x86_64__ */
++
++#if defined (__powerpc__) && defined(HAVE_CPU_ARCH_PPC) && __GNUC__ >= 4
++
++/* A += B (ppc64) */
++#define ADD_1305_64(A2, A1, A0, B2, B1, B0) \
++      __asm__ ("addc %0, %3, %0\n" \
++	       "adde %1, %4, %1\n" \
++	       "adde %2, %5, %2\n" \
++	       : "+r" (A0), "+r" (A1), "+r" (A2) \
++	       : "r" (B0), "r" (B1), "r" (B2) \
++	       : "cc" )
++
++#endif /* __powerpc__ */
++
++#ifndef ADD_1305_64
++/* A += B (generic, mpi) */
++#  define ADD_1305_64(A2, A1, A0, B2, B1, B0) do { \
++    u64 carry; \
++    add_ssaaaa(carry, A0, 0, A0, 0, B0); \
++    add_ssaaaa(A2, A1, A2, A1, B2, B1); \
++    add_ssaaaa(A2, A1, A2, A1, 0, carry); \
++  } while (0)
++#endif
++
++/* H = H * R mod 2¹³⁰-5 */
++#define MUL_MOD_1305_64(H2, H1, H0, R1, R0, R1_MULT5) do { \
++    u64 x0_lo, x0_hi, x1_lo, x1_hi; \
++    u64 t0_lo, t0_hi, t1_lo, t1_hi; \
++    \
++    /* x = a * r (partial mod 2^130-5) */ \
++    umul_ppmm(x0_hi, x0_lo, H0, R0);  /* h0 * r0 */ \
++    umul_ppmm(x1_hi, x1_lo, H0, R1);  /* h0 * r1 */ \
++    \
++    umul_ppmm(t0_hi, t0_lo, H1, R1_MULT5); /* h1 * r1 mod 2^130-5 */ \
++    add_ssaaaa(x0_hi, x0_lo, x0_hi, x0_lo, t0_hi, t0_lo); \
++    umul_ppmm(t1_hi, t1_lo, H1, R0);       /* h1 * r0 */ \
++    add_ssaaaa(x1_hi, x1_lo, x1_hi, x1_lo, t1_hi, t1_lo); \
++    \
++    t1_lo = H2 * R1_MULT5; /* h2 * r1 mod 2^130-5 */ \
++    t1_hi = H2 * R0;       /* h2 * r0 */ \
++    add_ssaaaa(H0, H1, x1_hi, x1_lo, t1_hi, t1_lo); \
++    \
++    /* carry propagation */ \
++    H2 = H0 & 3; \
++    H0 = (H0 >> 2) * 5; /* msb mod 2^130-5 */ \
++    ADD_1305_64(H2, H1, H0, (u64)0, x0_hi, x0_lo); \
++  } while (0)
++
++#ifndef HAVE_ASM_POLY1305_BLOCKS
++
++static unsigned int
++poly1305_blocks (poly1305_context_t *ctx, const byte *buf, size_t len,
++		 byte high_pad)
++{
++  POLY1305_STATE *st = &ctx->state;
++  u64 r0, r1, r1_mult5;
++  u64 h0, h1, h2;
++  u64 m0, m1, m2;
++
++  m2 = high_pad;
++
++  h0 = st->h[0] + ((u64)st->h[1] << 32);
++  h1 = st->h[2] + ((u64)st->h[3] << 32);
++  h2 = st->h[4];
++
++  r0 = st->r[0] + ((u64)st->r[1] << 32);
++  r1 = st->r[2] + ((u64)st->r[3] << 32);
++
++  r1_mult5 = (r1 >> 2) + r1;
++
++  m0 = buf_get_le64(buf + 0);
++  m1 = buf_get_le64(buf + 8);
++  buf += POLY1305_BLOCKSIZE;
++  len -= POLY1305_BLOCKSIZE;
++
++  while (len >= POLY1305_BLOCKSIZE)
++    {
++      /* a = h + m */
++      ADD_1305_64(h2, h1, h0, m2, m1, m0);
++
++      m0 = buf_get_le64(buf + 0);
++      m1 = buf_get_le64(buf + 8);
++
++      /* h = a * r (partial mod 2^130-5) */
++      MUL_MOD_1305_64(h2, h1, h0, r1, r0, r1_mult5);
++
++      buf += POLY1305_BLOCKSIZE;
++      len -= POLY1305_BLOCKSIZE;
++    }
++
++  /* a = h + m */
++  ADD_1305_64(h2, h1, h0, m2, m1, m0);
++
++  /* h = a * r (partial mod 2^130-5) */
++  MUL_MOD_1305_64(h2, h1, h0, r1, r0, r1_mult5);
++
++  st->h[0] = h0;
++  st->h[1] = h0 >> 32;
++  st->h[2] = h1;
++  st->h[3] = h1 >> 32;
++  st->h[4] = h2;
++
++  return 6 * sizeof (void *) + 18 * sizeof (u64);
++}
++
++#endif /* !HAVE_ASM_POLY1305_BLOCKS */
++
++static unsigned int poly1305_final (poly1305_context_t *ctx,
++				    byte mac[POLY1305_TAGLEN])
++{
++  POLY1305_STATE *st = &ctx->state;
++  unsigned int burn = 0;
++  u64 u, carry;
++  u64 k0, k1;
++  u64 h0, h1;
++  u64 h2;
++
++  /* process the remaining block */
++  if (ctx->leftover)
++    {
++      ctx->buffer[ctx->leftover++] = 1;
++      if (ctx->leftover < POLY1305_BLOCKSIZE)
++	{
++	  memset (&ctx->buffer[ctx->leftover], 0,
++		  POLY1305_BLOCKSIZE - ctx->leftover);
++	  ctx->leftover = POLY1305_BLOCKSIZE;
++	}
++      burn = poly1305_blocks (ctx, ctx->buffer, POLY1305_BLOCKSIZE, 0);
++    }
++
++  h0 = st->h[0] + ((u64)st->h[1] << 32);
++  h1 = st->h[2] + ((u64)st->h[3] << 32);
++  h2 = st->h[4];
++
++  k0 = st->k[0] + ((u64)st->k[1] << 32);
++  k1 = st->k[2] + ((u64)st->k[3] << 32);
++
++  /* check if h is more than 2^130-5, by adding 5. */
++  add_ssaaaa(carry, u, 0, h0, 0, 5);
++  add_ssaaaa(carry, u, 0, carry, 0, h1);
++  u = (carry + h2) >> 2; /* u == 0 or 1 */
++
++  /* minus 2^130-5 ... (+5) */
++  u = (-u) & 5;
++  add_ssaaaa(h1, h0, h1, h0, 0, u);
++
++  /* add high part of key + h */
++  add_ssaaaa(h1, h0, h1, h0, k1, k0);
++  buf_put_le64(mac + 0, h0);
++  buf_put_le64(mac + 8, h1);
++
++  /* burn_stack */
++  return 4 * sizeof (void *) + 7 * sizeof (u64) + burn;
++}
++
++#endif /* USE_MPI_64BIT */
++
++#ifdef USE_MPI_32BIT
++
++#ifdef HAVE_COMPATIBLE_GCC_ARM_PLATFORM_AS
++
++/* HI:LO += A * B (arm) */
++#define UMUL_ADD_32(HI, LO, A, B) \
++      __asm__ ("umlal %1, %0, %4, %5" \
++	       : "=r" (HI), "=r" (LO) \
++	       : "0" (HI), "1" (LO), "r" (A), "r" (B) )
++
++/* A += B (arm) */
++#define ADD_1305_32(A4, A3, A2, A1, A0, B4, B3, B2, B1, B0) \
++      __asm__ ("adds %0, %0, %5\n" \
++	       "adcs %1, %1, %6\n" \
++	       "adcs %2, %2, %7\n" \
++	       "adcs %3, %3, %8\n" \
++	       "adc %4, %4, %9\n" \
++	       : "+r" (A0), "+r" (A1), "+r" (A2), "+r" (A3), "+r" (A4) \
++	       : "r" (B0), "r" (B1), "r" (B2), "r" (B3), "r" (B4) \
++	       : "cc" )
++
++#endif /* HAVE_COMPATIBLE_GCC_ARM_PLATFORM_AS */
++
++#if defined (__i386__) && defined(HAVE_CPU_ARCH_X86) && __GNUC__ >= 5
++/* Note: ADD_1305_32 below does not compile on GCC-4.7 */
++
++/* A += B (i386) */
++#define ADD_1305_32(A4, A3, A2, A1, A0, B4, B3, B2, B1, B0) \
++      __asm__ ("addl %5, %0\n" \
++	       "adcl %6, %1\n" \
++	       "adcl %7, %2\n" \
++	       "adcl %8, %3\n" \
++	       "adcl %9, %4\n" \
++	       : "+r" (A0), "+r" (A1), "+r" (A2), "+r" (A3), "+r" (A4) \
++	       : "g" (B0), "g" (B1), "g" (B2), "g" (B3), "g" (B4) \
++	       : "cc" )
++
++#endif /* __i386__ */
++
++#ifndef UMUL_ADD_32
++/* HI:LO += A * B (generic, mpi) */
++#  define UMUL_ADD_32(HI, LO, A, B) do { \
++    u32 t_lo, t_hi; \
++    umul_ppmm(t_hi, t_lo, A, B); \
++    add_ssaaaa(HI, LO, HI, LO, t_hi, t_lo); \
++  } while (0)
++#endif
++
++#ifndef ADD_1305_32
++/* A += B (generic, mpi) */
++#  define ADD_1305_32(A4, A3, A2, A1, A0, B4, B3, B2, B1, B0) do { \
++    u32 carry0, carry1, carry2; \
++    add_ssaaaa(carry0, A0, 0, A0, 0, B0); \
++    add_ssaaaa(carry1, A1, 0, A1, 0, B1); \
++    add_ssaaaa(carry1, A1, carry1, A1, 0, carry0); \
++    add_ssaaaa(carry2, A2, 0, A2, 0, B2); \
++    add_ssaaaa(carry2, A2, carry2, A2, 0, carry1); \
++    add_ssaaaa(A4, A3, A4, A3, B4, B3); \
++    add_ssaaaa(A4, A3, A4, A3, 0, carry2); \
++  } while (0)
++#endif
++
++/* H = H * R mod 2¹³⁰-5 */
++#define MUL_MOD_1305_32(H4, H3, H2, H1, H0, R3, R2, R1, R0, \
++                        R3_MULT5, R2_MULT5, R1_MULT5) do { \
++    u32 x0_lo, x0_hi, x1_lo, x1_hi, x2_lo, x2_hi, x3_lo, x3_hi; \
++    u32 t0_lo, t0_hi; \
++    \
++    /* x = a * r (partial mod 2^130-5) */ \
++    umul_ppmm(x0_hi, x0_lo, H0, R0);  /* h0 * r0 */ \
++    umul_ppmm(x1_hi, x1_lo, H0, R1);  /* h0 * r1 */ \
++    umul_ppmm(x2_hi, x2_lo, H0, R2);  /* h0 * r2 */ \
++    umul_ppmm(x3_hi, x3_lo, H0, R3);  /* h0 * r3 */ \
++    \
++    UMUL_ADD_32(x0_hi, x0_lo, H1, R3_MULT5); /* h1 * r3 mod 2^130-5 */ \
++    UMUL_ADD_32(x1_hi, x1_lo, H1, R0);       /* h1 * r0 */ \
++    UMUL_ADD_32(x2_hi, x2_lo, H1, R1);       /* h1 * r1 */ \
++    UMUL_ADD_32(x3_hi, x3_lo, H1, R2);       /* h1 * r2 */ \
++    \
++    UMUL_ADD_32(x0_hi, x0_lo, H2, R2_MULT5); /* h2 * r2 mod 2^130-5 */ \
++    UMUL_ADD_32(x1_hi, x1_lo, H2, R3_MULT5); /* h2 * r3 mod 2^130-5 */ \
++    UMUL_ADD_32(x2_hi, x2_lo, H2, R0);       /* h2 * r0 */ \
++    UMUL_ADD_32(x3_hi, x3_lo, H2, R1);       /* h2 * r1 */ \
++    \
++    UMUL_ADD_32(x0_hi, x0_lo, H3, R1_MULT5); /* h3 * r1 mod 2^130-5 */ \
++    H1 = x0_hi; \
++    UMUL_ADD_32(x1_hi, x1_lo, H3, R2_MULT5); /* h3 * r2 mod 2^130-5 */ \
++    UMUL_ADD_32(x2_hi, x2_lo, H3, R3_MULT5); /* h3 * r3 mod 2^130-5 */ \
++    UMUL_ADD_32(x3_hi, x3_lo, H3, R0);       /* h3 * r0 */ \
++    \
++    t0_lo = H4 * R1_MULT5; /* h4 * r1 mod 2^130-5 */ \
++    t0_hi = H4 * R2_MULT5; /* h4 * r2 mod 2^130-5 */ \
++    add_ssaaaa(H2, x1_lo, x1_hi, x1_lo, 0, t0_lo); \
++    add_ssaaaa(H3, x2_lo, x2_hi, x2_lo, 0, t0_hi); \
++    t0_lo = H4 * R3_MULT5; /* h4 * r3 mod 2^130-5 */ \
++    t0_hi = H4 * R0;       /* h4 * r0 */ \
++    add_ssaaaa(H4, x3_lo, x3_hi, x3_lo, t0_hi, t0_lo); \
++    \
++    /* carry propagation */ \
++    H0 = (H4 >> 2) * 5; /* msb mod 2^130-5 */ \
++    H4 = H4 & 3; \
++    ADD_1305_32(H4, H3, H2, H1, H0, 0, x3_lo, x2_lo, x1_lo, x0_lo); \
++  } while (0)
++
++#ifndef HAVE_ASM_POLY1305_BLOCKS
++
++static unsigned int
++poly1305_blocks (poly1305_context_t *ctx, const byte *buf, size_t len,
++		 byte high_pad)
++{
++  POLY1305_STATE *st = &ctx->state;
++  u32 r1_mult5, r2_mult5, r3_mult5;
++  u32 h0, h1, h2, h3, h4;
++  u32 m0, m1, m2, m3, m4;
++
++  m4 = high_pad;
++
++  h0 = st->h[0];
++  h1 = st->h[1];
++  h2 = st->h[2];
++  h3 = st->h[3];
++  h4 = st->h[4];
++
++  r1_mult5 = (st->r[1] >> 2) + st->r[1];
++  r2_mult5 = (st->r[2] >> 2) + st->r[2];
++  r3_mult5 = (st->r[3] >> 2) + st->r[3];
++
++  while (len >= POLY1305_BLOCKSIZE)
++    {
++      m0 = buf_get_le32(buf + 0);
++      m1 = buf_get_le32(buf + 4);
++      m2 = buf_get_le32(buf + 8);
++      m3 = buf_get_le32(buf + 12);
++
++      /* a = h + m */
++      ADD_1305_32(h4, h3, h2, h1, h0, m4, m3, m2, m1, m0);
++
++      /* h = a * r (partial mod 2^130-5) */
++      MUL_MOD_1305_32(h4, h3, h2, h1, h0,
++		      st->r[3], st->r[2], st->r[1], st->r[0],
++		      r3_mult5, r2_mult5, r1_mult5);
++
++      buf += POLY1305_BLOCKSIZE;
++      len -= POLY1305_BLOCKSIZE;
++    }
++
++  st->h[0] = h0;
++  st->h[1] = h1;
++  st->h[2] = h2;
++  st->h[3] = h3;
++  st->h[4] = h4;
++
++  return 6 * sizeof (void *) + 28 * sizeof (u32);
++}
++
++#endif /* !HAVE_ASM_POLY1305_BLOCKS */
++
++static unsigned int poly1305_final (poly1305_context_t *ctx,
++				    byte mac[POLY1305_TAGLEN])
++{
++  POLY1305_STATE *st = &ctx->state;
++  unsigned int burn = 0;
++  u32 carry, tmp0, tmp1, tmp2, u;
++  u32 h4, h3, h2, h1, h0;
++
++  /* process the remaining block */
++  if (ctx->leftover)
++    {
++      ctx->buffer[ctx->leftover++] = 1;
++      if (ctx->leftover < POLY1305_BLOCKSIZE)
++	{
++	  memset (&ctx->buffer[ctx->leftover], 0,
++		  POLY1305_BLOCKSIZE - ctx->leftover);
++	  ctx->leftover = POLY1305_BLOCKSIZE;
++	}
++      burn = poly1305_blocks (ctx, ctx->buffer, POLY1305_BLOCKSIZE, 0);
++    }
++
++  h0 = st->h[0];
++  h1 = st->h[1];
++  h2 = st->h[2];
++  h3 = st->h[3];
++  h4 = st->h[4];
++
++  /* check if h is more than 2^130-5, by adding 5. */
++  add_ssaaaa(carry, tmp0, 0, h0, 0, 5);
++  add_ssaaaa(carry, tmp0, 0, carry, 0, h1);
++  add_ssaaaa(carry, tmp0, 0, carry, 0, h2);
++  add_ssaaaa(carry, tmp0, 0, carry, 0, h3);
++  u = (carry + h4) >> 2; /* u == 0 or 1 */
++
++  /* minus 2^130-5 ... (+5) */
++  u = (-u) & 5;
++  add_ssaaaa(carry, h0, 0, h0, 0, u);
++  add_ssaaaa(carry, h1, 0, h1, 0, carry);
++  add_ssaaaa(carry, h2, 0, h2, 0, carry);
++  add_ssaaaa(carry, h3, 0, h3, 0, carry);
++
++  /* add high part of key + h */
++  add_ssaaaa(tmp0, h0, 0, h0, 0, st->k[0]);
++  add_ssaaaa(tmp1, h1, 0, h1, 0, st->k[1]);
++  add_ssaaaa(tmp1, h1, tmp1, h1, 0, tmp0);
++  add_ssaaaa(tmp2, h2, 0, h2, 0, st->k[2]);
++  add_ssaaaa(tmp2, h2, tmp2, h2, 0, tmp1);
++  add_ssaaaa(carry, h3, 0, h3, 0, st->k[3]);
++  h3 += tmp2;
++
++  buf_put_le32(mac + 0, h0);
++  buf_put_le32(mac + 4, h1);
++  buf_put_le32(mac + 8, h2);
++  buf_put_le32(mac + 12, h3);
++
++  /* burn_stack */
++  return 4 * sizeof (void *) + 10 * sizeof (u32) + burn;
++}
++
++#endif /* USE_MPI_32BIT */
++
++
++unsigned int
++_gcry_poly1305_update_burn (poly1305_context_t *ctx, const byte *m,
++			    size_t bytes)
++{
++  unsigned int burn = 0;
++
++  /* handle leftover */
++  if (ctx->leftover)
++    {
++      size_t want = (POLY1305_BLOCKSIZE - ctx->leftover);
++      if (want > bytes)
++	want = bytes;
++      buf_cpy (ctx->buffer + ctx->leftover, m, want);
++      bytes -= want;
++      m += want;
++      ctx->leftover += want;
++      if (ctx->leftover < POLY1305_BLOCKSIZE)
++	return 0;
++      burn = poly1305_blocks (ctx, ctx->buffer, POLY1305_BLOCKSIZE, 1);
++      ctx->leftover = 0;
++    }
++
++  /* process full blocks */
++  if (bytes >= POLY1305_BLOCKSIZE)
++    {
++      size_t nblks = bytes / POLY1305_BLOCKSIZE;
++      burn = poly1305_blocks (ctx, m, nblks * POLY1305_BLOCKSIZE, 1);
++      m += nblks * POLY1305_BLOCKSIZE;
++      bytes -= nblks * POLY1305_BLOCKSIZE;
++    }
++
++  /* store leftover */
++  if (bytes)
++    {
++      buf_cpy (ctx->buffer + ctx->leftover, m, bytes);
++      ctx->leftover += bytes;
++    }
++
++  return burn;
++}
++
++
++void
++_gcry_poly1305_update (poly1305_context_t *ctx, const byte *m, size_t bytes)
++{
++  unsigned int burn;
++
++  burn = _gcry_poly1305_update_burn (ctx, m, bytes);
++
++  if (burn)
++    _gcry_burn_stack (burn);
++}
++
++
++void
++_gcry_poly1305_finish (poly1305_context_t *ctx, byte mac[POLY1305_TAGLEN])
++{
++  unsigned int burn;
++
++  burn = poly1305_final (ctx, mac);
++
++  _gcry_burn_stack (burn);
++}
++
++
++gcry_err_code_t
++_gcry_poly1305_init (poly1305_context_t * ctx, const byte * key,
++		     size_t keylen)
++{
++  static int initialized;
++  static const char *selftest_failed;
++
++  if (!initialized)
++    {
++      initialized = 1;
++      selftest_failed = selftest ();
++      if (selftest_failed)
++	log_error ("Poly1305 selftest failed (%s)\n", selftest_failed);
++    }
++
++  if (keylen != POLY1305_KEYLEN)
++    return GPG_ERR_INV_KEYLEN;
++
++  if (selftest_failed)
++    return GPG_ERR_SELFTEST_FAILED;
++
++  poly1305_init (ctx, key);
++
++  return 0;
++}
++
++
++static void
++poly1305_auth (byte mac[POLY1305_TAGLEN], const byte * m, size_t bytes,
++	       const byte * key)
++{
++  poly1305_context_t ctx;
++
++  memset (&ctx, 0, sizeof (ctx));
++
++  _gcry_poly1305_init (&ctx, key, POLY1305_KEYLEN);
++  _gcry_poly1305_update (&ctx, m, bytes);
++  _gcry_poly1305_finish (&ctx, mac);
++
++  wipememory (&ctx, sizeof (ctx));
++}
++
++
++static const char *
++selftest (void)
++{
++  /* example from nacl */
++  static const byte nacl_key[POLY1305_KEYLEN] = {
++    0xee, 0xa6, 0xa7, 0x25, 0x1c, 0x1e, 0x72, 0x91,
++    0x6d, 0x11, 0xc2, 0xcb, 0x21, 0x4d, 0x3c, 0x25,
++    0x25, 0x39, 0x12, 0x1d, 0x8e, 0x23, 0x4e, 0x65,
++    0x2d, 0x65, 0x1f, 0xa4, 0xc8, 0xcf, 0xf8, 0x80,
++  };
++
++  static const byte nacl_msg[131] = {
++    0x8e, 0x99, 0x3b, 0x9f, 0x48, 0x68, 0x12, 0x73,
++    0xc2, 0x96, 0x50, 0xba, 0x32, 0xfc, 0x76, 0xce,
++    0x48, 0x33, 0x2e, 0xa7, 0x16, 0x4d, 0x96, 0xa4,
++    0x47, 0x6f, 0xb8, 0xc5, 0x31, 0xa1, 0x18, 0x6a,
++    0xc0, 0xdf, 0xc1, 0x7c, 0x98, 0xdc, 0xe8, 0x7b,
++    0x4d, 0xa7, 0xf0, 0x11, 0xec, 0x48, 0xc9, 0x72,
++    0x71, 0xd2, 0xc2, 0x0f, 0x9b, 0x92, 0x8f, 0xe2,
++    0x27, 0x0d, 0x6f, 0xb8, 0x63, 0xd5, 0x17, 0x38,
++    0xb4, 0x8e, 0xee, 0xe3, 0x14, 0xa7, 0xcc, 0x8a,
++    0xb9, 0x32, 0x16, 0x45, 0x48, 0xe5, 0x26, 0xae,
++    0x90, 0x22, 0x43, 0x68, 0x51, 0x7a, 0xcf, 0xea,
++    0xbd, 0x6b, 0xb3, 0x73, 0x2b, 0xc0, 0xe9, 0xda,
++    0x99, 0x83, 0x2b, 0x61, 0xca, 0x01, 0xb6, 0xde,
++    0x56, 0x24, 0x4a, 0x9e, 0x88, 0xd5, 0xf9, 0xb3,
++    0x79, 0x73, 0xf6, 0x22, 0xa4, 0x3d, 0x14, 0xa6,
++    0x59, 0x9b, 0x1f, 0x65, 0x4c, 0xb4, 0x5a, 0x74,
++    0xe3, 0x55, 0xa5
++  };
++
++  static const byte nacl_mac[16] = {
++    0xf3, 0xff, 0xc7, 0x70, 0x3f, 0x94, 0x00, 0xe5,
++    0x2a, 0x7d, 0xfb, 0x4b, 0x3d, 0x33, 0x05, 0xd9
++  };
++
++  /* generates a final value of (2^130 - 2) == 3 */
++  static const byte wrap_key[POLY1305_KEYLEN] = {
++    0x02, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
++    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
++    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
++    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
++  };
++
++  static const byte wrap_msg[16] = {
++    0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
++    0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff
++  };
++
++  static const byte wrap_mac[16] = {
++    0x03, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
++    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
++  };
++
++  /* mac of the macs of messages of length 0 to 256, where the key and messages
++   * have all their values set to the length
++   */
++  static const byte total_key[POLY1305_KEYLEN] = {
++    0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07,
++    0xff, 0xfe, 0xfd, 0xfc, 0xfb, 0xfa, 0xf9,
++    0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
++    0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff
++  };
++
++  static const byte total_mac[16] = {
++    0x64, 0xaf, 0xe2, 0xe8, 0xd6, 0xad, 0x7b, 0xbd,
++    0xd2, 0x87, 0xf9, 0x7c, 0x44, 0x62, 0x3d, 0x39
++  };
++
++  poly1305_context_t ctx;
++  poly1305_context_t total_ctx;
++  byte all_key[POLY1305_KEYLEN];
++  byte all_msg[256];
++  byte mac[16];
++  size_t i, j;
++
++  memset (&ctx, 0, sizeof (ctx));
++  memset (&total_ctx, 0, sizeof (total_ctx));
++
++  memset (mac, 0, sizeof (mac));
++  poly1305_auth (mac, nacl_msg, sizeof (nacl_msg), nacl_key);
++  if (memcmp (nacl_mac, mac, sizeof (nacl_mac)) != 0)
++    return "Poly1305 test 1 failed.";
++
++  /* SSE2/AVX have a 32 byte block size, but also support 64 byte blocks, so
++   * make sure everything still works varying between them */
++  memset (mac, 0, sizeof (mac));
++  _gcry_poly1305_init (&ctx, nacl_key, POLY1305_KEYLEN);
++  _gcry_poly1305_update (&ctx, nacl_msg + 0, 32);
++  _gcry_poly1305_update (&ctx, nacl_msg + 32, 64);
++  _gcry_poly1305_update (&ctx, nacl_msg + 96, 16);
++  _gcry_poly1305_update (&ctx, nacl_msg + 112, 8);
++  _gcry_poly1305_update (&ctx, nacl_msg + 120, 4);
++  _gcry_poly1305_update (&ctx, nacl_msg + 124, 2);
++  _gcry_poly1305_update (&ctx, nacl_msg + 126, 1);
++  _gcry_poly1305_update (&ctx, nacl_msg + 127, 1);
++  _gcry_poly1305_update (&ctx, nacl_msg + 128, 1);
++  _gcry_poly1305_update (&ctx, nacl_msg + 129, 1);
++  _gcry_poly1305_update (&ctx, nacl_msg + 130, 1);
++  _gcry_poly1305_finish (&ctx, mac);
++  if (memcmp (nacl_mac, mac, sizeof (nacl_mac)) != 0)
++    return "Poly1305 test 2 failed.";
++
++  memset (mac, 0, sizeof (mac));
++  poly1305_auth (mac, wrap_msg, sizeof (wrap_msg), wrap_key);
++  if (memcmp (wrap_mac, mac, sizeof (nacl_mac)) != 0)
++    return "Poly1305 test 3 failed.";
++
++  _gcry_poly1305_init (&total_ctx, total_key, POLY1305_KEYLEN);
++  for (i = 0; i < 256; i++)
++    {
++      /* set key and message to 'i,i,i..' */
++      for (j = 0; j < sizeof (all_key); j++)
++	all_key[j] = i;
++      for (j = 0; j < i; j++)
++	all_msg[j] = i;
++      poly1305_auth (mac, all_msg, i, all_key);
++      _gcry_poly1305_update (&total_ctx, mac, 16);
++    }
++  _gcry_poly1305_finish (&total_ctx, mac);
++  if (memcmp (total_mac, mac, sizeof (total_mac)) != 0)
++    return "Poly1305 test 4 failed.";
++
++  return NULL;
++}
++
++#endif /* ENABLE_PPC_CRYPTO_SUPPORT */
+diff --git a/cipher/poly1305.c b/cipher/poly1305.c
+index 22255fb1..b45a9dc8 100644
+--- a/cipher/poly1305.c
++++ b/cipher/poly1305.c
+@@ -23,6 +23,11 @@
+  */
+ 
+ #include <config.h>
++
++#if !defined(ENABLE_PPC_CRYPTO_SUPPORT) || \
++    !defined(HAVE_COMPATIBLE_CC_PPC_ALTIVEC) || \
++    !defined(HAVE_GCC_INLINE_ASM_PPC_ALTIVEC)
++
+ #include <stdio.h>
+ #include <stdlib.h>
+ #include <string.h>
+@@ -641,3 +646,5 @@ selftest (void)
+ 
+   return NULL;
+ }
++
++#endif /* ENABLE_PPC_CRYPTO_SUPPORT */
+diff --git a/configure.ac b/configure.ac
+index 9bcb1318..397c2f19 100644
+--- a/configure.ac
++++ b/configure.ac
+@@ -2504,6 +2504,18 @@ if test "$found" = "1" ; then
+          GCRYPT_CIPHERS="$GCRYPT_CIPHERS chacha20-ssse3-amd64.lo"
+          GCRYPT_CIPHERS="$GCRYPT_CIPHERS chacha20-avx2-amd64.lo"
+       ;;
++      powerpc64le-*-*)
++         # Build with the ppc8 vector implementation
++         GCRYPT_CIPHERS="$GCRYPT_CIPHERS chacha20-ppc.lo chacha20-new.lo"
++      ;;
++      powerpc64-*-*)
++         # Build with the ppc8 vector implementation
++         GCRYPT_CIPHERS="$GCRYPT_CIPHERS chacha20-ppc.lo chacha20-new.lo"
++      ;;
++      powerpc-*-*)
++         # Build with the ppc8 vector implementation
++	 GCRYPT_CIPHERS="$GCRYPT_CIPHERS chacha20-ppc.lo chacha20-new.lo"
++      ;;
+    esac
+ 
+    if test x"$neonsupport" = xyes ; then
+@@ -2518,6 +2530,18 @@ case "${host}" in
+       GCRYPT_CIPHERS="$GCRYPT_CIPHERS poly1305-sse2-amd64.lo"
+       GCRYPT_CIPHERS="$GCRYPT_CIPHERS poly1305-avx2-amd64.lo"
+    ;;
++   powerpc64le-*-*)
++      # Build with the ppc8 vector implementation
++      GCRYPT_CIPHERS="$GCRYPT_CIPHERS poly1305-new.lo"
++   ;;
++   powerpc64-*-*)
++      # Build with the ppc8 vector implementation
++      GCRYPT_CIPHERS="$GCRYPT_CIPHERS poly1305-new.lo"
++   ;;
++   powerpc-*-*)
++      # Build with the ppc8 vector implementation
++      GCRYPT_CIPHERS="$GCRYPT_CIPHERS poly1305-new.lo"
++   ;;
+ esac
+ 
+ if test x"$neonsupport" = xyes ; then
+diff --git a/mpi/longlong.h b/mpi/longlong.h
+index d6958f3b..c0f24c85 100644
+--- a/mpi/longlong.h
++++ b/mpi/longlong.h
+@@ -1088,7 +1088,6 @@ typedef unsigned int UTItype __attribute__ ((mode (TI)));
+ /* Powerpc 64 bit support taken from gmp-4.1.2. */
+ /* We should test _IBMR2 here when we add assembly support for the system
+    vendor compilers.  */
+-#if 0 /* Not yet enabled because we don't have hardware for a test. */
+ #if (defined (_ARCH_PPC) || defined (__powerpc__)) && W_TYPE_SIZE == 64
+ #define add_ssaaaa(sh, sl, ah, al, bh, bl) \
+   do {									\
+@@ -1141,7 +1140,6 @@ typedef unsigned int UTItype __attribute__ ((mode (TI)));
+ #define SMUL_TIME 14  /* ??? */
+ #define UDIV_TIME 120 /* ??? */
+ #endif /* 64-bit PowerPC.  */
+-#endif /* if 0 */
+ 
+ /***************************************
+  **************  PYR  ******************
+
+diff --git a/cipher/poly1305-internal-new.h b/cipher/poly1305-internal-new.h
+new file mode 100644
+index 00000000..c0f24c85 100644
+--- /dev/null
++++ b/cipher/poly1305-internal-new.h
+@@ -0,0 +1,64 @@
++/* poly1305-internal.h  -  Poly1305 internals
++ * Copyright (C) 2014 Jussi Kivilinna <jussi.kivilinna@iki.fi>
++ *
++ * This file is part of Libgcrypt.
++ *
++ * Libgcrypt is free software; you can redistribute it and/or modify
++ * it under the terms of the GNU Lesser general Public License as
++ * published by the Free Software Foundation; either version 2.1 of
++ * the License, or (at your option) any later version.
++ *
++ * Libgcrypt is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++ * GNU Lesser General Public License for more details.
++ *
++ * You should have received a copy of the GNU Lesser General Public
++ * License along with this program; if not, see <http://www.gnu.org/licenses/>.
++ */
++
++#ifndef G10_POLY1305_INTERNAL_H
++#define G10_POLY1305_INTERNAL_H
++
++#include <config.h>
++#include <stdio.h>
++#include <stdlib.h>
++#include <string.h>
++#include "types.h"
++#include "g10lib.h"
++#include "cipher.h"
++#include "bufhelp.h"
++
++#define POLY1305_TAGLEN 16
++#define POLY1305_KEYLEN 32
++#define POLY1305_BLOCKSIZE 16
++
++
++typedef struct
++{
++  u32 k[4];
++  u32 r[4];
++  u32 h[5];
++} POLY1305_STATE;
++
++typedef struct poly1305_context_s
++{
++  POLY1305_STATE state;
++  byte buffer[POLY1305_BLOCKSIZE];
++  unsigned int leftover;
++} poly1305_context_t;
++
++
++gcry_err_code_t _gcry_poly1305_init (poly1305_context_t *ctx, const byte *key,
++				     size_t keylen);
++
++void _gcry_poly1305_finish (poly1305_context_t *ctx,
++			     byte mac[POLY1305_TAGLEN]);
++
++void _gcry_poly1305_update (poly1305_context_t *ctx, const byte *buf,
++			     size_t buflen);
++
++unsigned int _gcry_poly1305_update_burn (poly1305_context_t *ctx,
++					 const byte *m, size_t bytes);
++
++#endif /* G10_POLY1305_INTERNAL_H */
+
+-- 
+2.27.0
+
