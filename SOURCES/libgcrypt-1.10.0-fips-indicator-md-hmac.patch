@@ -1,0 +1,277 @@
+From fd832687f36c1885d2388c55f7e8569184ba2593 Mon Sep 17 00:00:00 2001
+From: Tobias Heider <tobias.heider@canonical.com>
+Date: Thu, 16 Feb 2023 03:20:48 +0100
+Subject: [PATCH] fips: Add explicit indicators for md and mac algorithms
+
+* src/fips.c (_gcry_fips_indicator_mac): New function indicating
+  non-approved mac algorithms
+  (_gcry_fips_indicator_md): new functions indicating non-approved
+  message digest algorithms
+* src/g10lib.h (_gcry_fips_indicator_mac): new function
+  (_gcry_fips_indicator_md): ditto
+* src/gcrypt.h.in (enum gcry_ctl_cmds): New symbols
+  GCRYCTL_FIPS_SERVICE_INDICATOR_MAC and
+  GCRYCTL_FIPS_SERVICE_INDICATOR_MD
+* src/global.c (_gcry_vcontrol): Handle new FIPS indicators.
+* doc/gcrypt.texi: Document the new option.
+--
+
+Signed-off-by: Tobias Heider <tobias.heider@canonical.com>
+---
+ doc/gcrypt.texi | 13 +++++++++++++
+ src/fips.c      | 51 +++++++++++++++++++++++++++++++++++++++++++++++++
+ src/g10lib.h    |  2 ++
+ src/gcrypt.h.in |  4 +++-
+ src/global.c    | 14 ++++++++++++++
+ 5 files changed, 83 insertions(+), 1 deletion(-)
+
+diff --git a/doc/gcrypt.texi b/doc/gcrypt.texi
+index e44c2f2e..462c5931 100644
+--- a/doc/gcrypt.texi
++++ b/doc/gcrypt.texi
+@@ -992,6 +992,19 @@ certification. If the function is approved, this function returns
+ @code{GPG_ERR_NO_ERROR} (other restrictions might still apply).
+ Otherwise @code{GPG_ERR_NOT_SUPPORTED} is returned.
+ 
++@item GCRYCTL_FIPS_SERVICE_INDICATOR_MAC; Arguments: enum gcry_mac_algos
++
++Check if the given MAC is approved under the current FIPS 140-3
++certification. If the MAC is approved, this function returns
++@code{GPG_ERR_NO_ERROR}. Otherwise @code{GPG_ERR_NOT_SUPPORTED}
++is returned.
++
++@item GCRYCTL_FIPS_SERVICE_INDICATOR_MD; Arguments: enum gcry_md_algos
++
++Check if the given message digest algorithm is approved under the current
++FIPS 140-3 certification. If the algorithm is approved, this function returns
++@code{GPG_ERR_NO_ERROR}. Otherwise @code{GPG_ERR_NOT_SUPPORTED} is returned.
++
+ @end table
+ 
+ @end deftypefun
+diff --git a/src/fips.c b/src/fips.c
+index 272aabae..8b3b3f04 100644
+--- a/src/fips.c
++++ b/src/fips.c
+@@ -377,6 +377,57 @@ _gcry_fips_indicator_cipher (va_list arg_ptr)
+     }
+ }
+ 
++int
++_gcry_fips_indicator_mac (va_list arg_ptr)
++{
++  enum gcry_mac_algos alg = va_arg (arg_ptr, enum gcry_mac_algos);
++
++  switch (alg)
++    {
++    case GCRY_MAC_CMAC_AES:
++    case GCRY_MAC_HMAC_SHA1:
++    case GCRY_MAC_HMAC_SHA224:
++    case GCRY_MAC_HMAC_SHA256:
++    case GCRY_MAC_HMAC_SHA384:
++    case GCRY_MAC_HMAC_SHA512:
++    case GCRY_MAC_HMAC_SHA512_224:
++    case GCRY_MAC_HMAC_SHA512_256:
++    case GCRY_MAC_HMAC_SHA3_224:
++    case GCRY_MAC_HMAC_SHA3_256:
++    case GCRY_MAC_HMAC_SHA3_384:
++    case GCRY_MAC_HMAC_SHA3_512:
++      return GPG_ERR_NO_ERROR;
++    default:
++      return GPG_ERR_NOT_SUPPORTED;
++    }
++}
++
++int
++_gcry_fips_indicator_md (va_list arg_ptr)
++{
++  enum gcry_md_algos alg = va_arg (arg_ptr, enum gcry_md_algos);
++
++  switch (alg)
++    {
++    case GCRY_MD_SHA1:
++    case GCRY_MD_SHA224:
++    case GCRY_MD_SHA256:
++    case GCRY_MD_SHA384:
++    case GCRY_MD_SHA512:
++    case GCRY_MD_SHA512_224:
++    case GCRY_MD_SHA512_256:
++    case GCRY_MD_SHA3_224:
++    case GCRY_MD_SHA3_256:
++    case GCRY_MD_SHA3_384:
++    case GCRY_MD_SHA3_512:
++    case GCRY_MD_SHAKE128:
++    case GCRY_MD_SHAKE256:
++      return GPG_ERR_NO_ERROR;
++    default:
++      return GPG_ERR_NOT_SUPPORTED;
++    }
++}
++
+ int
+ _gcry_fips_indicator_kdf (va_list arg_ptr)
+ {
+diff --git a/src/g10lib.h b/src/g10lib.h
+index 6be0ab21..86337eed 100644
+--- a/src/g10lib.h
++++ b/src/g10lib.h
+@@ -467,6 +467,8 @@ void _gcry_fips_signal_error (const char *srcfile,
+ #endif
+ 
+ int _gcry_fips_indicator_cipher (va_list arg_ptr);
++int _gcry_fips_indicator_mac (va_list arg_ptr);
++int _gcry_fips_indicator_md (va_list arg_ptr);
+ int _gcry_fips_indicator_kdf (va_list arg_ptr);
+ int _gcry_fips_indicator_function (va_list arg_ptr);
+ 
+diff --git a/src/gcrypt.h.in b/src/gcrypt.h.in
+index aba22bfc..54080d46 100644
+--- a/src/gcrypt.h.in
++++ b/src/gcrypt.h.in
+@@ -330,7 +330,9 @@ enum gcry_ctl_cmds
+     GCRYCTL_FIPS_SERVICE_INDICATOR_CIPHER = 81,
+     GCRYCTL_FIPS_SERVICE_INDICATOR_KDF = 82,
+     GCRYCTL_NO_FIPS_MODE = 83,
+-    GCRYCTL_FIPS_SERVICE_INDICATOR_FUNCTION = 84
++    GCRYCTL_FIPS_SERVICE_INDICATOR_FUNCTION = 84,
++    GCRYCTL_FIPS_SERVICE_INDICATOR_MAC = 85,
++    GCRYCTL_FIPS_SERVICE_INDICATOR_MD = 86
+   };
+ 
+ /* Perform various operations defined by CMD. */
+diff --git a/src/global.c b/src/global.c
+index debf6194..d16d3709 100644
+--- a/src/global.c
++++ b/src/global.c
+@@ -791,6 +791,20 @@ _gcry_vcontrol (enum gcry_ctl_cmds cmd, va_list arg_ptr)
+       rc = _gcry_fips_indicator_cipher (arg_ptr);
+       break;
+ 
++    case GCRYCTL_FIPS_SERVICE_INDICATOR_MAC:
++      /* Get FIPS Service Indicator for a given message authentication code.
++       * Returns GPG_ERR_NO_ERROR if algorithm is allowed or
++       * GPG_ERR_NOT_SUPPORTED otherwise */
++      rc = _gcry_fips_indicator_mac (arg_ptr);
++      break;
++
++    case GCRYCTL_FIPS_SERVICE_INDICATOR_MD:
++      /* Get FIPS Service Indicator for a given message digest. Returns
++       * GPG_ERR_NO_ERROR if algorithm is allowed or GPG_ERR_NOT_SUPPORTED
++       * otherwise */
++      rc = _gcry_fips_indicator_md (arg_ptr);
++      break;
++
+     case GCRYCTL_FIPS_SERVICE_INDICATOR_KDF:
+       /* Get FIPS Service Indicator for a given KDF. Returns GPG_ERR_NO_ERROR
+        * if algorithm is allowed or GPG_ERR_NOT_SUPPORTED otherwise */
+-- 
+2.39.2
+
+From 2d193a955d05b4b9caed2895cf25600add3484da Mon Sep 17 00:00:00 2001
+From: Tobias Heider <tobias.heider@canonical.com>
+Date: Thu, 16 Feb 2023 03:21:26 +0100
+Subject: [PATCH] fips: Unblock MD5 in fips mode but mark non-approved in
+ indicator.
+
+* cipher/mac-hmac.c (_gcry_mac_type_spec_hmac_md5): allow in fips mode
+* cipher/md5.c (_gcry_digest_spec_md5): allow in fips mode
+--
+
+Signed-off-by: Tobias Heider <tobias.heider@canonical.com>
+---
+ cipher/mac-hmac.c | 2 +-
+ cipher/md5.c      | 2 +-
+ 2 files changed, 2 insertions(+), 2 deletions(-)
+
+diff --git a/cipher/mac-hmac.c b/cipher/mac-hmac.c
+index f1ab568b..9fac77dc 100644
+--- a/cipher/mac-hmac.c
++++ b/cipher/mac-hmac.c
+@@ -1413,7 +1413,7 @@ const gcry_mac_spec_t _gcry_mac_type_spec_hmac_tiger1 = {
+ #endif
+ #if USE_MD5
+ const gcry_mac_spec_t _gcry_mac_type_spec_hmac_md5 = {
+-  GCRY_MAC_HMAC_MD5, {0, 0}, "HMAC_MD5",
++  GCRY_MAC_HMAC_MD5, {0, 1}, "HMAC_MD5",
+   &hmac_ops
+ };
+ #endif
+diff --git a/cipher/md5.c b/cipher/md5.c
+index 5457fc38..744a2cc1 100644
+--- a/cipher/md5.c
++++ b/cipher/md5.c
+@@ -314,7 +314,7 @@ static const gcry_md_oid_spec_t oid_spec_md5[] =
+ 
+ const gcry_md_spec_t _gcry_digest_spec_md5 =
+   {
+-    GCRY_MD_MD5, {0, 0},
++    GCRY_MD_MD5, {0, 1},
+     "MD5", asn, DIM (asn), oid_spec_md5, 16,
+     md5_init, _gcry_md_block_write, md5_final, md5_read, NULL,
+     NULL,
+-- 
+2.39.2
+
+From f52f33389da3302f51b6b00451cf9fc7e7a7e277 Mon Sep 17 00:00:00 2001
+From: Jakub Jelen <jjelen@redhat.com>
+Date: Mon, 6 Mar 2023 17:26:17 +0100
+Subject: [PATCH] tests: Improve test coverage for FIPS service indicators
+
+* tests/basic.c (check_digests): Check the FIPS indicators
+  (check_mac): Ditto.
+--
+
+Signed-off-by: Jakub Jelen <jjelen@redhat.com>
+---
+ tests/basic.c | 13 +++++++++++++
+ 1 file changed, 13 insertions(+)
+
+diff --git a/tests/basic.c b/tests/basic.c
+index 095bdc97..5d5ceac9 100644
+--- a/tests/basic.c
++++ b/tests/basic.c
+@@ -14086,6 +14086,7 @@ check_mac (void)
+ 	"\x13\x46\x76\xfb\x6d\xe0\x44\x60\x65\xc9\x74\x40\xfa\x8c\x6a\x58" },
+       {	0 },
+     };
++  gcry_error_t err;
+   int i;
+ 
+   if (verbose)
+@@ -15370,6 +15370,12 @@ check_digests (void)
+         {
+           if (in_fips_mode)
+             {
++              err = gcry_control(GCRYCTL_FIPS_SERVICE_INDICATOR_MD, algos[i].md);
++              if (err == GPG_ERR_NO_ERROR)
++                {
++                  fail ("algo %d, gcry_md_test_algo failed while it should"
++                        " have worked in FIPS mode\n", algos[i].md);
++                }
+               if (verbose)
+                 fprintf (stderr, "  algorithm %d not available in fips mode\n",
+                          algos[i].md);
+@@ -16948,6 +16954,7 @@ check_mac (void)
+ #endif /* USE_GOST28147 */
+       { 0 },
+     };
++  gcry_error_t err;
+   int i;
+ 
+   if (verbose)
+@@ -16961,6 +16968,12 @@ check_mac (void)
+         {
+           if (in_fips_mode)
+             {
++              err = gcry_control(GCRYCTL_FIPS_SERVICE_INDICATOR_MAC, algos[i].algo);
++              if (err == GPG_ERR_NO_ERROR)
++                {
++                  fail ("algo %d, gcry_mac_test_algo failed while it should"
++                        " have worked in FIPS mode\n", algos[i].algo);
++                }
+               if (verbose)
+                 fprintf (stderr, "  algorithm %d not available in fips mode\n",
+                          algos[i].algo);
+-- 
+2.39.2
+

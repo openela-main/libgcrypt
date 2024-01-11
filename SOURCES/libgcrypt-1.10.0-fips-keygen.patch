@@ -1,0 +1,55 @@
+From cd30ed3c0d715aa0c58a32a29cfb1476163a5b94 Mon Sep 17 00:00:00 2001
+From: NIIBE Yutaka <gniibe@fsij.org>
+Date: Wed, 20 Apr 2022 15:09:41 +0900
+Subject: [PATCH] cipher: Change the bounds for RSA key generation round.
+
+* cipher/rsa.c (generate_fips): Use 10 for p, 20 for q.
+
+--
+
+Constants from FIPS 186-5-draft.
+
+GnuPG-bug-id: 5919
+Signed-off-by: NIIBE Yutaka <gniibe@fsij.org>
+---
+ cipher/rsa.c | 8 ++++----
+ 1 file changed, 4 insertions(+), 4 deletions(-)
+
+diff --git a/cipher/rsa.c b/cipher/rsa.c
+index 486a34f0..771413b3 100644
+--- a/cipher/rsa.c
++++ b/cipher/rsa.c
+@@ -476,7 +476,7 @@ generate_fips (RSA_secret_key *sk, unsigned int nbits, unsigned long use_e,
+ 
+  retry:
+   /* generate p and q */
+-  for (i = 0; i < 5 * pbits; i++)
++  for (i = 0; i < 10 * pbits; i++)
+     {
+     ploop:
+       if (!testparms)
+@@ -506,10 +506,10 @@ generate_fips (RSA_secret_key *sk, unsigned int nbits, unsigned long use_e,
+       else if (testparms)
+         goto err;
+     }
+-  if (i >= 5 * pbits)
++  if (i >= 10 * pbits)
+     goto err;
+ 
+-  for (i = 0; i < 5 * pbits; i++)
++  for (i = 0; i < 20 * pbits; i++)
+     {
+     qloop:
+       if (!testparms)
+@@ -555,7 +555,7 @@ generate_fips (RSA_secret_key *sk, unsigned int nbits, unsigned long use_e,
+       else if (testparms)
+         goto err;
+     }
+-  if (i >= 5 * pbits)
++  if (i >= 20 * pbits)
+     goto err;
+ 
+   if (testparms)
+-- 
+2.37.3
+

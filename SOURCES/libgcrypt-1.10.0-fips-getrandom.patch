@@ -1,0 +1,50 @@
+From 0a5e608b8b18d4f41e4d7434c6262bf11507f859 Mon Sep 17 00:00:00 2001
+From: Jakub Jelen <jjelen@redhat.com>
+Date: Tue, 16 Aug 2022 15:30:43 +0200
+Subject: [PATCH] random: Use getrandom (GRND_RANDOM) in FIPS mode
+
+The SP800-90C (clarified in IG D.K.) requires the following when
+different DRBGs are chained:
+ * the parent needs to be reseeded before generate operation
+ * the reseed & generate needs to be atomic
+
+In RHEL, this is addressed by change in the kernel, that will do this
+automatically, when the getentropy () is called with GRND_RANDOM flag.
+
+* random/rndgetentropy.c (_gcry_rndgetentropy_gather_random): Use
+  GRND_RANDOM in FIPS Mode
+---
+
+Signed-off-by: Jakub Jelen <jjelen@redhat.com>
+---
+ random/rndgetentropy.c | 5 ++++-
+ 1 file changed, 4 insertions(+), 1 deletion(-)
+
+diff --git a/random/rndgetentropy.c b/random/rndgetentropy.c
+index 7580873e..db4b09ed 100644
+--- a/random/rndgetentropy.c
++++ b/random/rndgetentropy.c
+@@ -82,9 +82,18 @@ _gcry_rndgetentropy_gather_random (void (*add)(const void*, size_t,
+        * never blocking once the kernel is seeded.  */
+       do
+         {
+-          nbytes = length < sizeof (buffer)? length : sizeof (buffer);
+           _gcry_pre_syscall ();
+-          ret = getentropy (buffer, nbytes);
++          if (fips_mode ())
++            {
++              /* The getrandom API returns maximum 32 B of strong entropy */
++              nbytes = length < 32 ? length : 32;
++              ret = getrandom (buffer, nbytes, GRND_RANDOM);
++            }
++          else
++            {
++              nbytes = length < sizeof (buffer) ? length : sizeof (buffer);
++              ret = getentropy (buffer, nbytes);
++            }
+           _gcry_post_syscall ();
+         }
+       while (ret == -1 && errno == EINTR);
+-- 
+2.37.1
+

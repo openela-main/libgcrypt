@@ -1,0 +1,190 @@
+From 3c8b6c4a9cad59c5e1db5706f6774a3141b60210 Mon Sep 17 00:00:00 2001
+From: NIIBE Yutaka <gniibe@fsij.org>
+Date: Thu, 17 Feb 2022 10:28:05 +0900
+Subject: [PATCH] fips: Fix gen-note-integrity.sh script not to use cmp
+ utility.
+
+* src/gen-note-integrity.sh: Simplify detecting 32-bit machine
+or 64-bit machine.
+
+--
+
+GnuPG-bug-id: 5835
+Signed-off-by: NIIBE Yutaka <gniibe@fsij.org>
+---
+ src/gen-note-integrity.sh | 8 ++++----
+ 1 file changed, 4 insertions(+), 4 deletions(-)
+
+diff --git a/src/gen-note-integrity.sh b/src/gen-note-integrity.sh
+index 969fdca6..878d7095 100755
+--- a/src/gen-note-integrity.sh
++++ b/src/gen-note-integrity.sh
+@@ -73,9 +73,9 @@ FILE=.libs/libgcrypt.so
+ #
+ # Fixup the ELF header to clean up section information
+ #
+-printf '%b' '\002' > 2.bin
+-dd ibs=1 skip=4 count=1 if=$FILE status=none > class-byte.bin
+-if cmp class-byte.bin 2.bin; then
++BYTE002=$(printf '%b' '\002')
++CLASS_BYTE=$(dd ibs=1 skip=4 count=1 if=$FILE status=none)
++if test "$CLASS_BYTE" = "$BYTE002"; then
+     CLASS=64
+     HEADER_SIZE=64
+ else
+@@ -112,4 +112,4 @@ END { print offset}")
+  dd ibs=1 skip=$HEADER_SIZE count=$OFFSET if=$FILE status=none) \
+  | ./hmac256 --stdkey --binary
+ 
+-rm -f 2.bin class-byte.bin header-fixed.bin
++rm -f header-fixed.bin
+-- 
+2.39.1
+
+
+From 052c5ef4cea56772b7015e36f231fa0bcbf91410 Mon Sep 17 00:00:00 2001
+From: NIIBE Yutaka <gniibe@fsij.org>
+Date: Thu, 17 Feb 2022 11:21:35 +0900
+Subject: [PATCH] fips: Clarify what to be hashed for the integrity check.
+
+* src/fips.c (get_file_offset): Compute the maximum offset
+of segments.
+* src/gen-note-integrity.sh: Likewise.
+
+--
+
+The result is same (in current format of ELF program).
+Semantics is more clear.  It hashes:
+
+  - From the start of shared library file,
+  - fixed up the ELF header to exclude link-time information,
+  - up to the last segment.
+
+Signed-off-by: NIIBE Yutaka <gniibe@fsij.org>
+---
+ src/fips.c                | 20 +++++++++-----------
+ src/gen-note-integrity.sh | 20 ++++++++++++++------
+ 2 files changed, 23 insertions(+), 17 deletions(-)
+
+diff --git a/src/fips.c b/src/fips.c
+index d798d577..89f8204b 100644
+--- a/src/fips.c
++++ b/src/fips.c
+@@ -595,7 +595,7 @@ run_random_selftests (void)
+ 
+ /*
+  * In the ELF file opened as FP, fill the ELF header to the pointer
+- * EHDR_P, determine the offset of last loadable segment in R_OFFSET.
++ * EHDR_P, determine the maximum offset of segments in R_OFFSET.
+  * Also, find the section which contains the hmac value and return it
+  * in HMAC.  Rewinds FP to the beginning on success.
+  */
+@@ -624,24 +624,22 @@ get_file_offset (FILE *fp, ElfW (Ehdr) *ehdr_p,
+   if (fseek (fp, ehdr_p->e_phoff, SEEK_SET) != 0)
+     return gpg_error_from_syserror ();
+ 
+-  /* Iterate over the program headers, determine the last loadable
+-     segment.  */
++  /* Iterate over the program headers, determine the last offset of
++     segments.  */
+   for (i = 0; i < ehdr_p->e_phnum; i++)
+     {
++      unsigned long off;
++
+       if (fread (&phdr, sizeof (phdr), 1, fp) != 1)
+         return gpg_error_from_syserror ();
+ 
+-      if (phdr.p_type == PT_PHDR)
+-        continue;
+-
+-      if (phdr.p_type != PT_LOAD)
+-        break;
+-
+-      off_segment = phdr.p_offset + phdr.p_filesz;
++      off = phdr.p_offset + phdr.p_filesz;
++      if (off_segment < off)
++        off_segment = off;
+     }
+ 
+   if (!off_segment)
+-    /* The segment not found in the file */
++    /* No segment found in the file */
+     return gpg_error (GPG_ERR_INV_OBJ);
+ 
+   /* The section header entry size should match the size of the shdr struct */
+diff --git a/src/gen-note-integrity.sh b/src/gen-note-integrity.sh
+index 878d7095..50071bf5 100755
+--- a/src/gen-note-integrity.sh
++++ b/src/gen-note-integrity.sh
+@@ -95,21 +95,29 @@ else
+     dd ibs=1         count=6  if=/dev/zero status=none
+ fi > header-fixed.bin
+ 
+-# Compute the end of loadable segment.
++#
++# Compute the end of segments, and emit the COUNT to read
++# (For each segment in program headers, calculate the offset
++#  and select the maximum)
+ #
+ # This require computation in hexadecimal, and GNU awk needs
+ # --non-decimal-data option
+ #
+-OFFSET=$($READELF --wide --program-headers $FILE | \
+-         $AWK $AWK_OPTION "/^  LOAD/ { offset=\$2+\$5-$HEADER_SIZE }\
+-END { print offset}")
++COUNT=$($READELF --wide --program-headers $FILE | \
++         $AWK $AWK_OPTION \
++"BEGIN { max_offset=0 }
++/^\$/ { if (program_headers_start) program_headers_end=1 }
++(program_headers_start && !program_headers_end) { offset = \$2 + \$5 }
++(max_offset < offset) { max_offset = offset }
++/^  Type/ { program_headers_start=1 }
++END { print max_offset- $HEADER_SIZE }")
+ 
+ #
+-# Feed the header fixed and loadable segments to HMAC256
++# Feed the header fixed and all segments to HMAC256
+ # to generate hmac hash of the FILE
+ #
+ (cat header-fixed.bin; \
+- dd ibs=1 skip=$HEADER_SIZE count=$OFFSET if=$FILE status=none) \
++ dd ibs=1 skip=$HEADER_SIZE count=$COUNT if=$FILE status=none) \
+  | ./hmac256 --stdkey --binary
+ 
+ rm -f header-fixed.bin
+-- 
+2.39.1
+
+
+From 3fd3bb31597f80c76a94ea62e42d58d796beabf1 Mon Sep 17 00:00:00 2001
+From: Jakub Jelen <jjelen@redhat.com>
+Date: Mon, 20 Feb 2023 16:16:01 +0100
+Subject: [PATCH] fips: Check return value from ftell
+
+* src/fips.c (get_file_offset): Check return value of ftell to be able
+  to detect errors.
+--
+
+Originally reported by coverity.
+
+Signed-off-by: Jakub Jelen <jjelen@redhat.com>
+---
+ src/fips.c | 2 ++
+ 1 file changed, 2 insertions(+)
+
+diff --git a/src/fips.c b/src/fips.c
+index 272aabae..0d89b6da 100644
+--- a/src/fips.c
++++ b/src/fips.c
+@@ -681,6 +681,8 @@ get_file_offset (FILE *fp, ElfW (Ehdr) *ehdr_p,
+         return gpg_error_from_syserror ();
+ 
+       off = ftell (fp);
++      if (off < 0)
++        return gpg_error_from_syserror ();
+       if (shdr.sh_type == SHT_NOTE && shdr.sh_flags == 0 && shdr.sh_size == 48)
+         {
+           const char header_of_the_note[] = {
+-- 
+2.39.2
+

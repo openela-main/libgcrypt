@@ -1,0 +1,1008 @@
+From beb5d6df5c5785db7c32a24a5d2a351cb964bfbc Mon Sep 17 00:00:00 2001
+From: Clemens Lang via Gcrypt-devel <gcrypt-devel@lists.gnupg.org>
+Date: Mon, 14 Feb 2022 18:49:59 +0100
+Subject: [PATCH] fips: Use ELF header to find hmac file offset
+
+* src/fips.c [ENABLE_HMAC_BINARY_CHECK] (hmac256_check): Use ELF headers
+  to locate the file offset for the HMAC in addition to information from
+  the loader
+
+--
+
+The previous method of locating the offset of the .rodata1 section in
+the ELF file on disk used information obtained from the loader. This
+computed the address of the value in memory at runtime, but the offset
+in the file can be different. Specifically, the old code computed
+a value relative to ElfW(Phdr).p_vaddr, but the offset in the file is
+relative to ElfW(Phdr).p_offset. These values can differ, so the
+computed address at runtime must be translated into a file offset
+relative to p_offset.
+
+This is largely cosmetic, since the text section that should contain the
+HMAC usually has both p_vaddr and p_offset set to 0.
+
+Signed-off-by: Clemens Lang <cllang@redhat.com>
+---
+ README     |  3 ++-
+ src/fips.c | 73 +++++++++++++++++++++++++++++++++++++++++++++++++-----
+ 2 files changed, 69 insertions(+), 7 deletions(-)
+
+diff --git a/README b/README
+index 3b465c1b..4d7697dd 100644
+--- a/README
++++ b/README
+@@ -157,7 +157,8 @@
+      --enable-hmac-binary-check
+                      Include support to check the binary at runtime
+                      against a HMAC checksum.  This works only in FIPS
+-                     mode and on systems providing the dladdr function.
++                     mode on systems providing the dladdr function and using
++                     the ELF binary format.
+ 
+      --with-fips-module-version=version
+                      Specify a string used as a module version for FIPS
+diff --git a/src/fips.c b/src/fips.c
+index 391b94f1..c40274d9 100644
+--- a/src/fips.c
++++ b/src/fips.c
+@@ -25,6 +25,8 @@
+ #include <string.h>
+ #ifdef ENABLE_HMAC_BINARY_CHECK
+ # include <dlfcn.h>
++# include <elf.h>
++# include <limits.h>
+ # include <link.h>
+ #endif
+ #ifdef HAVE_SYSLOG
+@@ -594,6 +596,57 @@ run_random_selftests (void)
+ static const unsigned char __attribute__ ((section (".rodata1")))
+ hmac_for_the_implementation[HMAC_LEN];
+ 
++/**
++ * Determine the offset of the given virtual address in the ELF file opened as
++ * fp and return it in offset. Rewinds fp to the beginning on success.
++ */
++static gpg_error_t
++get_file_offset (FILE *fp, unsigned long paddr, unsigned long *offset)
++{
++  ElfW (Ehdr) ehdr;
++  ElfW (Phdr) phdr;
++  uint16_t e_phidx;
++
++  // read the ELF header
++  if (0 != fseek (fp, 0, SEEK_SET))
++    return gpg_error_from_syserror ();
++  if (1 != fread (&ehdr, sizeof (ehdr), 1, fp))
++    return gpg_error_from_syserror ();
++
++  // the section header entry size should match the size of the shdr struct
++  if (ehdr.e_phentsize != sizeof (phdr))
++    return gpg_error (GPG_ERR_INV_OBJ);
++  if (ehdr.e_phoff == 0)
++    return gpg_error (GPG_ERR_INV_OBJ);
++
++  // jump to the first program header
++  if (0 != fseek (fp, ehdr.e_phoff, SEEK_SET))
++    return gpg_error_from_syserror ();
++
++  // iterate over the program headers, compare their virtual addresses with the
++  // address we are looking for, and if the program header matches, calculate
++  // the offset of the given paddr in the file using the program header's
++  // p_offset field.
++  for (e_phidx = 0; e_phidx < ehdr.e_phnum; e_phidx++)
++    {
++      if (1 != fread (&phdr, sizeof (phdr), 1, fp))
++        return gpg_error_from_syserror ();
++      if (phdr.p_type == PT_LOAD && phdr.p_vaddr <= paddr
++          && phdr.p_vaddr + phdr.p_memsz > paddr)
++        {
++          // found section, compute the offset of paddr in the file
++          *offset = phdr.p_offset + (paddr - phdr.p_vaddr);
++
++          if (0 != fseek (fp, 0, SEEK_SET))
++            return gpg_error_from_syserror ();
++          return 0;
++        }
++    }
++
++  // section not found in the file
++  return gpg_error (GPG_ERR_INV_OBJ);
++}
++
+ static gpg_error_t
+ hmac256_check (const char *filename, const char *key, struct link_map *lm)
+ {
+@@ -603,6 +656,7 @@ hmac256_check (const char *filename, const char *key, struct link_map *lm)
+   size_t buffer_size, nread;
+   char *buffer;
+   unsigned long paddr;
++  unsigned long offset = 0;
+   unsigned long off = 0;
+ 
+   paddr = (unsigned long)hmac_for_the_implementation - lm->l_addr;
+@@ -611,6 +665,13 @@ hmac256_check (const char *filename, const char *key, struct link_map *lm)
+   if (!fp)
+     return gpg_error (GPG_ERR_INV_OBJ);
+ 
++  err = get_file_offset (fp, paddr, &offset);
++  if (err)
++    {
++      fclose (fp);
++      return err;
++    }
++
+   err = _gcry_md_open (&hd, GCRY_MD_SHA256, GCRY_MD_FLAG_HMAC);
+   if (err)
+     {
+@@ -651,14 +712,14 @@ hmac256_check (const char *filename, const char *key, struct link_map *lm)
+       nread = fread (buffer+HMAC_LEN, 1, buffer_size, fp);
+       if (nread < buffer_size)
+         {
+-          if (off - HMAC_LEN <= paddr && paddr <= off + nread)
+-            memset (buffer + HMAC_LEN + paddr - off, 0, HMAC_LEN);
++          if (off - HMAC_LEN <= offset && offset <= off + nread)
++            memset (buffer + HMAC_LEN + offset - off, 0, HMAC_LEN);
+           _gcry_md_write (hd, buffer, nread+HMAC_LEN);
+           break;
+         }
+ 
+-      if (off - HMAC_LEN <= paddr && paddr <= off + nread)
+-        memset (buffer + HMAC_LEN + paddr - off, 0, HMAC_LEN);
++      if (off - HMAC_LEN <= offset && offset <= off + nread)
++        memset (buffer + HMAC_LEN + offset - off, 0, HMAC_LEN);
+       _gcry_md_write (hd, buffer, nread);
+       memcpy (buffer, buffer+buffer_size, HMAC_LEN);
+       off += nread;
+@@ -694,8 +755,8 @@ check_binary_integrity (void)
+   const char *key = KEY_FOR_BINARY_CHECK;
+   void *extra_info;
+ 
+-  if (!dladdr1 (hmac_for_the_implementation,
+-                &info, &extra_info, RTLD_DL_LINKMAP))
++  if (!dladdr1 (hmac_for_the_implementation, &info, &extra_info,
++                RTLD_DL_LINKMAP))
+     err = gpg_error_from_syserror ();
+   else
+     err = hmac256_check (info.dli_fname, key, extra_info);
+-- 
+2.39.0
+
+
+From 521500624b4b11538d206137205e2a511dad7072 Mon Sep 17 00:00:00 2001
+From: NIIBE Yutaka <gniibe@fsij.org>
+Date: Tue, 15 Feb 2022 20:38:02 +0900
+Subject: [PATCH] fips: Fix previous commit.
+
+--
+
+Coding style fix.
+
+Signed-off-by: NIIBE Yutaka <gniibe@fsij.org>
+---
+ src/fips.c | 64 +++++++++++++++++++++++++++---------------------------
+ 1 file changed, 32 insertions(+), 32 deletions(-)
+
+diff --git a/src/fips.c b/src/fips.c
+index c40274d9..f16bce8b 100644
+--- a/src/fips.c
++++ b/src/fips.c
+@@ -596,54 +596,55 @@ run_random_selftests (void)
+ static const unsigned char __attribute__ ((section (".rodata1")))
+ hmac_for_the_implementation[HMAC_LEN];
+ 
+-/**
+- * Determine the offset of the given virtual address in the ELF file opened as
+- * fp and return it in offset. Rewinds fp to the beginning on success.
++/*
++ * In the ELF file opened as FP, determine the offset of the given
++ * virtual address ADDR and return it in OFFSET.  Rewinds FP to the
++ * beginning on success.
+  */
+ static gpg_error_t
+-get_file_offset (FILE *fp, unsigned long paddr, unsigned long *offset)
++get_file_offset (FILE *fp, unsigned long addr, unsigned long *offset)
+ {
+   ElfW (Ehdr) ehdr;
+   ElfW (Phdr) phdr;
+   uint16_t e_phidx;
+ 
+-  // read the ELF header
+-  if (0 != fseek (fp, 0, SEEK_SET))
++  /* Read the ELF header */
++  if (fseek (fp, 0, SEEK_SET) != 0)
+     return gpg_error_from_syserror ();
+-  if (1 != fread (&ehdr, sizeof (ehdr), 1, fp))
++  if (fread (&ehdr, sizeof (ehdr), 1, fp) != 1)
+     return gpg_error_from_syserror ();
+ 
+-  // the section header entry size should match the size of the shdr struct
++  /* The program header entry size should match the size of the phdr struct */
+   if (ehdr.e_phentsize != sizeof (phdr))
+     return gpg_error (GPG_ERR_INV_OBJ);
+   if (ehdr.e_phoff == 0)
+     return gpg_error (GPG_ERR_INV_OBJ);
+ 
+-  // jump to the first program header
+-  if (0 != fseek (fp, ehdr.e_phoff, SEEK_SET))
++  /* Jump to the first program header */
++  if (fseek (fp, ehdr.e_phoff, SEEK_SET) != 0)
+     return gpg_error_from_syserror ();
+ 
+-  // iterate over the program headers, compare their virtual addresses with the
+-  // address we are looking for, and if the program header matches, calculate
+-  // the offset of the given paddr in the file using the program header's
+-  // p_offset field.
++  /* Iterate over the program headers, compare their virtual addresses
++     with the address we are looking for, and if the program header
++     matches, calculate the offset of the given ADDR in the file using
++     the program header's p_offset field.  */
+   for (e_phidx = 0; e_phidx < ehdr.e_phnum; e_phidx++)
+     {
+-      if (1 != fread (&phdr, sizeof (phdr), 1, fp))
++      if (fread (&phdr, sizeof (phdr), 1, fp) != 1)
+         return gpg_error_from_syserror ();
+-      if (phdr.p_type == PT_LOAD && phdr.p_vaddr <= paddr
+-          && phdr.p_vaddr + phdr.p_memsz > paddr)
++      if (phdr.p_type == PT_LOAD
++          && phdr.p_vaddr <= addr && addr < phdr.p_vaddr + phdr.p_memsz)
+         {
+-          // found section, compute the offset of paddr in the file
+-          *offset = phdr.p_offset + (paddr - phdr.p_vaddr);
++          /* Found segment, compute the offset of ADDR in the file */
++          *offset = phdr.p_offset + (addr - phdr.p_vaddr);
+ 
+-          if (0 != fseek (fp, 0, SEEK_SET))
++          if (fseek (fp, 0, SEEK_SET) != 0)
+             return gpg_error_from_syserror ();
+           return 0;
+         }
+     }
+ 
+-  // section not found in the file
++  /* Segment not found in the file */
+   return gpg_error (GPG_ERR_INV_OBJ);
+ }
+ 
+@@ -655,17 +656,16 @@ hmac256_check (const char *filename, const char *key, struct link_map *lm)
+   gcry_md_hd_t hd;
+   size_t buffer_size, nread;
+   char *buffer;
+-  unsigned long paddr;
++  unsigned long addr;
+   unsigned long offset = 0;
+-  unsigned long off = 0;
+-
+-  paddr = (unsigned long)hmac_for_the_implementation - lm->l_addr;
++  unsigned long pos = 0;
+ 
++  addr = (unsigned long)hmac_for_the_implementation - lm->l_addr;
+   fp = fopen (filename, "rb");
+   if (!fp)
+     return gpg_error (GPG_ERR_INV_OBJ);
+ 
+-  err = get_file_offset (fp, paddr, &offset);
++  err = get_file_offset (fp, addr, &offset);
+   if (err)
+     {
+       fclose (fp);
+@@ -698,7 +698,7 @@ hmac256_check (const char *filename, const char *key, struct link_map *lm)
+     }
+ 
+   nread = fread (buffer, 1, HMAC_LEN, fp);
+-  off += nread;
++  pos += nread;
+   if (nread < HMAC_LEN)
+     {
+       xfree (buffer);
+@@ -712,17 +712,17 @@ hmac256_check (const char *filename, const char *key, struct link_map *lm)
+       nread = fread (buffer+HMAC_LEN, 1, buffer_size, fp);
+       if (nread < buffer_size)
+         {
+-          if (off - HMAC_LEN <= offset && offset <= off + nread)
+-            memset (buffer + HMAC_LEN + offset - off, 0, HMAC_LEN);
++          if (pos - HMAC_LEN <= offset && offset <= pos + nread)
++            memset (buffer + HMAC_LEN + offset - pos, 0, HMAC_LEN);
+           _gcry_md_write (hd, buffer, nread+HMAC_LEN);
+           break;
+         }
+ 
+-      if (off - HMAC_LEN <= offset && offset <= off + nread)
+-        memset (buffer + HMAC_LEN + offset - off, 0, HMAC_LEN);
++      if (pos - HMAC_LEN <= offset && offset <= pos + nread)
++        memset (buffer + HMAC_LEN + offset - pos, 0, HMAC_LEN);
+       _gcry_md_write (hd, buffer, nread);
+       memcpy (buffer, buffer+buffer_size, HMAC_LEN);
+-      off += nread;
++      pos += nread;
+     }
+ 
+   if (ferror (fp))
+-- 
+2.39.1
+
+
+From 9dcf9305962b90febdf2d7cc73b49feadbf6a01f Mon Sep 17 00:00:00 2001
+From: NIIBE Yutaka <gniibe@fsij.org>
+Date: Wed, 16 Feb 2022 14:06:02 +0900
+Subject: [PATCH] fips: Integrity check improvement, with only loadable
+ segments.
+
+* configure.ac (READELF): Check the tool.
+* src/Makefile.am (libgcrypt.so.hmac): Use genhmac.sh with hmac256.
+* src/fips.c (get_file_offsets): Rename from get_file_offset.
+Determine the OFFSET2 at the end of loadable segments, too.
+Add fixup of the ELF header to exclude section information.
+(hmac256_check): Finish scanning at the end of loadble segments.
+* src/genhmac.sh: New.
+
+--
+
+This change fixes the build with ld.gold.
+
+GnuPG-bug-id: 5835
+Signed-off-by: NIIBE Yutaka <gniibe@fsij.org>
+---
+ configure.ac    |  1 +
+ src/Makefile.am |  4 +--
+ src/fips.c      | 73 +++++++++++++++++++++++++++++--------------
+ src/genhmac.sh  | 83 +++++++++++++++++++++++++++++++++++++++++++++++++
+ 4 files changed, 136 insertions(+), 25 deletions(-)
+ create mode 100755 src/genhmac.sh
+
+diff --git a/configure.ac b/configure.ac
+index f0f1637f..ea01f5a6 100644
+--- a/configure.ac
++++ b/configure.ac
+@@ -579,6 +579,7 @@ else
+     AC_DEFINE(ENABLE_HMAC_BINARY_CHECK,1,
+               [Define to support an HMAC based integrity check])
+     AC_CHECK_TOOL(OBJCOPY, [objcopy])
++    AC_CHECK_TOOL(READELF, [readelf])
+     if test "$use_hmac_binary_check" != yes ; then
+         DEF_HMAC_BINARY_CHECK=-DKEY_FOR_BINARY_CHECK="'\"$use_hmac_binary_check\"'"
+     fi
+diff --git a/src/Makefile.am b/src/Makefile.am
+index 018d5761..72100671 100644
+--- a/src/Makefile.am
++++ b/src/Makefile.am
+@@ -24,7 +24,7 @@ pkgconfigdir = $(libdir)/pkgconfig
+ pkgconfig_DATA = libgcrypt.pc
+ 
+ EXTRA_DIST = libgcrypt-config.in libgcrypt.m4 libgcrypt.vers \
+-             gcrypt.h.in libgcrypt.def libgcrypt.pc.in
++             gcrypt.h.in libgcrypt.def libgcrypt.pc.in genhmac.sh
+ 
+ bin_SCRIPTS = libgcrypt-config
+ m4datadir = $(datadir)/aclocal
+@@ -149,7 +149,7 @@ libgcrypt.la.done: libgcrypt.so.hmac
+ 	@touch libgcrypt.la.done
+ 
+ libgcrypt.so.hmac: hmac256 libgcrypt.la
+-	./hmac256 --stdkey --binary  < .libs/libgcrypt.so > $@
++	READELF=$(READELF) AWK=$(AWK) $(srcdir)/genhmac.sh > $@
+ else !USE_HMAC_BINARY_CHECK
+ libgcrypt.la.done: libgcrypt.la
+ 	@touch libgcrypt.la.done
+diff --git a/src/fips.c b/src/fips.c
+index f16bce8b..134d0eae 100644
+--- a/src/fips.c
++++ b/src/fips.c
+@@ -598,50 +598,68 @@ hmac_for_the_implementation[HMAC_LEN];
+ 
+ /*
+  * In the ELF file opened as FP, determine the offset of the given
+- * virtual address ADDR and return it in OFFSET.  Rewinds FP to the
++ * virtual address ADDR and return it in R_OFFSET1.  Determine the
++ * offset of last loadable section in R_OFFSET2.  Rewinds FP to the
+  * beginning on success.
+  */
+ static gpg_error_t
+-get_file_offset (FILE *fp, unsigned long addr, unsigned long *offset)
++get_file_offsets (FILE *fp, unsigned long addr, ElfW (Ehdr) *ehdr_p,
++                  unsigned long *r_offset1, unsigned long *r_offset2)
+ {
+-  ElfW (Ehdr) ehdr;
+   ElfW (Phdr) phdr;
+   uint16_t e_phidx;
++  long pos = 0;
+ 
+   /* Read the ELF header */
+   if (fseek (fp, 0, SEEK_SET) != 0)
+     return gpg_error_from_syserror ();
+-  if (fread (&ehdr, sizeof (ehdr), 1, fp) != 1)
++  if (fread (ehdr_p, sizeof (*ehdr_p), 1, fp) != 1)
+     return gpg_error_from_syserror ();
+ 
++  /* Fix up the ELF header, clean all section information.  */
++  ehdr_p->e_shoff = 0;
++  ehdr_p->e_shentsize = 0;
++  ehdr_p->e_shnum = 0;
++  ehdr_p->e_shstrndx = 0;
++
+   /* The program header entry size should match the size of the phdr struct */
+-  if (ehdr.e_phentsize != sizeof (phdr))
++  if (ehdr_p->e_phentsize != sizeof (phdr))
+     return gpg_error (GPG_ERR_INV_OBJ);
+-  if (ehdr.e_phoff == 0)
++  if (ehdr_p->e_phoff == 0)
+     return gpg_error (GPG_ERR_INV_OBJ);
+ 
+   /* Jump to the first program header */
+-  if (fseek (fp, ehdr.e_phoff, SEEK_SET) != 0)
++  if (fseek (fp, ehdr_p->e_phoff, SEEK_SET) != 0)
+     return gpg_error_from_syserror ();
+ 
+   /* Iterate over the program headers, compare their virtual addresses
+      with the address we are looking for, and if the program header
+      matches, calculate the offset of the given ADDR in the file using
+      the program header's p_offset field.  */
+-  for (e_phidx = 0; e_phidx < ehdr.e_phnum; e_phidx++)
++  for (e_phidx = 0; e_phidx < ehdr_p->e_phnum; e_phidx++)
+     {
+       if (fread (&phdr, sizeof (phdr), 1, fp) != 1)
+         return gpg_error_from_syserror ();
+-      if (phdr.p_type == PT_LOAD
+-          && phdr.p_vaddr <= addr && addr < phdr.p_vaddr + phdr.p_memsz)
+-        {
+-          /* Found segment, compute the offset of ADDR in the file */
+-          *offset = phdr.p_offset + (addr - phdr.p_vaddr);
+ 
+-          if (fseek (fp, 0, SEEK_SET) != 0)
+-            return gpg_error_from_syserror ();
+-          return 0;
+-        }
++      if (phdr.p_type == PT_PHDR)
++        continue;
++
++      if (phdr.p_type != PT_LOAD)
++        break;
++
++      pos = phdr.p_offset + phdr.p_filesz;
++      if (phdr.p_vaddr <= addr && addr < phdr.p_vaddr + phdr.p_memsz)
++        /* Found segment, compute the offset of ADDR in the file */
++        *r_offset1 = phdr.p_offset + (addr - phdr.p_vaddr);
++    }
++
++  if (*r_offset1)
++    {
++      if (fseek (fp, 0, SEEK_SET) != 0)
++        return gpg_error_from_syserror ();
++
++      *r_offset2 = (unsigned long)pos;
++      return 0;
+     }
+ 
+   /* Segment not found in the file */
+@@ -657,15 +675,17 @@ hmac256_check (const char *filename, const char *key, struct link_map *lm)
+   size_t buffer_size, nread;
+   char *buffer;
+   unsigned long addr;
+-  unsigned long offset = 0;
++  unsigned long offset1 = 0;
++  unsigned long offset2 = 0;
+   unsigned long pos = 0;
++  ElfW (Ehdr) ehdr;
+ 
+   addr = (unsigned long)hmac_for_the_implementation - lm->l_addr;
+   fp = fopen (filename, "rb");
+   if (!fp)
+     return gpg_error (GPG_ERR_INV_OBJ);
+ 
+-  err = get_file_offset (fp, addr, &offset);
++  err = get_file_offsets (fp, addr, &ehdr, &offset1, &offset2);
+   if (err)
+     {
+       fclose (fp);
+@@ -710,16 +730,23 @@ hmac256_check (const char *filename, const char *key, struct link_map *lm)
+   while (1)
+     {
+       nread = fread (buffer+HMAC_LEN, 1, buffer_size, fp);
++      if (pos + nread >= offset2)
++        nread = offset2 - pos;
++
++      /* Copy, fixed ELF header at the beginning.  */
++      if (pos - HMAC_LEN == 0)
++        memcpy (buffer, &ehdr, sizeof (ehdr));
++
+       if (nread < buffer_size)
+         {
+-          if (pos - HMAC_LEN <= offset && offset <= pos + nread)
+-            memset (buffer + HMAC_LEN + offset - pos, 0, HMAC_LEN);
++          if (pos - HMAC_LEN <= offset1 && offset1 <= pos + nread)
++            memset (buffer + HMAC_LEN + offset1 - pos, 0, HMAC_LEN);
+           _gcry_md_write (hd, buffer, nread+HMAC_LEN);
+           break;
+         }
+ 
+-      if (pos - HMAC_LEN <= offset && offset <= pos + nread)
+-        memset (buffer + HMAC_LEN + offset - pos, 0, HMAC_LEN);
++      if (pos - HMAC_LEN <= offset1 && offset1 <= pos + nread)
++        memset (buffer + HMAC_LEN + offset1 - pos, 0, HMAC_LEN);
+       _gcry_md_write (hd, buffer, nread);
+       memcpy (buffer, buffer+buffer_size, HMAC_LEN);
+       pos += nread;
+diff --git a/src/genhmac.sh b/src/genhmac.sh
+new file mode 100755
+index 00000000..bb33b9c6
+--- /dev/null
++++ b/src/genhmac.sh
+@@ -0,0 +1,83 @@
++#! /bin/sh
++
++#
++# genhmac.sh - Build tool to generate hmac hash
++#
++# Copyright (C) 2022  g10 Code GmbH
++#
++# This file is part of libgcrypt.
++#
++# libgcrypt is free software; you can redistribute it and/or
++# modify it under the terms of the GNU Lesser General Public License
++# as published by the Free Software Foundation; either version 2.1 of
++# the License, or (at your option) any later version.
++#
++# libgcrypt is distributed in the hope that it will be useful, but
++# WITHOUT ANY WARRANTY; without even the implied warranty of
++# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
++# Lesser General Public License for more details.
++#
++# You should have received a copy of the GNU Lesser General Public
++# License along with this program; if not, see <https://www.gnu.org/licenses/>.
++#
++
++set -e
++
++#
++# Following variables should be defined to invoke this script
++#
++#   READELF
++#   AWK
++#
++
++AWK_VERSION_OUTPUT=$($AWK 'BEGIN { print PROCINFO["version"] }')
++if test -n "$AWK_VERSION_OUTPUT"; then
++    # It's GNU awk, which supports PROCINFO.
++    AWK_OPTION=--non-decimal-data
++fi
++
++FILE=.libs/libgcrypt.so
++
++#
++# Fixup the ELF header to clean up section information
++#
++printf '%b' '\002' > 2.bin
++dd ibs=1 skip=4 count=1 if=$FILE status=none > class-byte.bin
++if cmp class-byte.bin 2.bin; then
++    CLASS=64
++    HEADER_SIZE=64
++else
++    CLASS=32
++    HEADER_SIZE=52
++fi
++
++if test $CLASS -eq 64; then
++    dd ibs=1         count=40 if=$FILE     status=none
++    dd ibs=1         count=8  if=/dev/zero status=none
++    dd ibs=1 skip=48 count=10 if=$FILE     status=none
++    dd ibs=1         count=6  if=/dev/zero status=none
++else
++    dd ibs=1         count=32 if=$FILE     status=none
++    dd ibs=1         count=4  if=/dev/zero status=none
++    dd ibs=1 skip=36 count=10 if=$FILE     status=none
++    dd ibs=1         count=6  if=/dev/zero status=none
++fi > header-fixed.bin
++
++# Compute the end of loadable segment.
++#
++# This require computation in hexadecimal, and GNU awk needs
++# --non-decimal-data option
++#
++OFFSET=$($READELF --wide --program-headers $FILE | \
++         $AWK $AWK_OPTION "/^  LOAD/ { offset=\$2+\$5-$HEADER_SIZE }\
++END { print offset}")
++
++#
++# Feed the header fixed and loadable segments to HMAC256
++# to generate hmac hash of the FILE
++#
++(cat header-fixed.bin; \
++ dd ibs=1 skip=$HEADER_SIZE count=$OFFSET if=$FILE status=none) \
++ | ./hmac256 --stdkey --binary
++
++rm -f 2.bin class-byte.bin header-fixed.bin
+-- 
+2.39.1
+
+
+From a340e980388243ceae6df57d101036f3f2a955be Mon Sep 17 00:00:00 2001
+From: NIIBE Yutaka <gniibe@fsij.org>
+Date: Wed, 16 Feb 2022 20:08:15 +0900
+Subject: [PATCH] fips: More portable integrity check.
+
+* src/Makefile.am (EXTRA_DIST): Change the name of the script.
+(libgcrypt.la.done): Invoce OBJCOPY with --add-section.
+(libgcrypt.so.hmac): Specify ECHO_N.
+* src/fips.c (get_file_offset): Rename from get_file_offsets.
+Find the note section and return the value in HMAC.
+(hmac256_check): Simplify by HMAC from the note section, not loaded.
+(check_binary_integrity): Use dladdr instead of dladdr1.
+* src/gen-note-integrity.sh: Rename from genhmac.sh.
+Generate ElfN_Nhdr, and then the hmac.
+
+--
+
+The idea of use of .note is by Daiki Ueno.
+    https://gitlab.com/dueno/integrity-notes
+
+Further, instead of NOTE segment loaded onto memory, use noload
+section in the file.
+
+Thanks to Clemens Lang for initiating this direction of improvement.
+
+The namespace "FDO" would need to be changed.
+
+GnuPG-bug-id: 5835
+Signed-off-by: NIIBE Yutaka <gniibe@fsij.org>
+---
+ src/Makefile.am                           |   8 +-
+ src/fips.c                                | 167 +++++++++++++---------
+ src/{genhmac.sh => gen-note-integrity.sh} |  34 ++++-
+ 3 files changed, 134 insertions(+), 75 deletions(-)
+ rename src/{genhmac.sh => gen-note-integrity.sh} (78%)
+
+diff --git a/src/Makefile.am b/src/Makefile.am
+index 72100671..b8bb187a 100644
+--- a/src/Makefile.am
++++ b/src/Makefile.am
+@@ -24,7 +24,7 @@ pkgconfigdir = $(libdir)/pkgconfig
+ pkgconfig_DATA = libgcrypt.pc
+ 
+ EXTRA_DIST = libgcrypt-config.in libgcrypt.m4 libgcrypt.vers \
+-             gcrypt.h.in libgcrypt.def libgcrypt.pc.in genhmac.sh
++             gcrypt.h.in libgcrypt.def libgcrypt.pc.in gen-note-integrity.sh
+ 
+ bin_SCRIPTS = libgcrypt-config
+ m4datadir = $(datadir)/aclocal
+@@ -143,13 +143,15 @@ if USE_HMAC_BINARY_CHECK
+ CLEANFILES += libgcrypt.so.hmac
+ 
+ libgcrypt.la.done: libgcrypt.so.hmac
+-	$(OBJCOPY) --update-section .rodata1=libgcrypt.so.hmac \
++	$(OBJCOPY) --add-section .note.fdo.integrity=libgcrypt.so.hmac \
++	  --set-section-flags .note.fdo.integrity=noload,readonly \
+ 	  .libs/libgcrypt.so .libs/libgcrypt.so.new
+ 	mv -f .libs/libgcrypt.so.new .libs/libgcrypt.so.*.*
+ 	@touch libgcrypt.la.done
+ 
+ libgcrypt.so.hmac: hmac256 libgcrypt.la
+-	READELF=$(READELF) AWK=$(AWK) $(srcdir)/genhmac.sh > $@
++	ECHO_N=$(ECHO_N) READELF=$(READELF) AWK=$(AWK) \
++	$(srcdir)/gen-note-integrity.sh > $@
+ else !USE_HMAC_BINARY_CHECK
+ libgcrypt.la.done: libgcrypt.la
+ 	@touch libgcrypt.la.done
+diff --git a/src/fips.c b/src/fips.c
+index 134d0eae..d798d577 100644
+--- a/src/fips.c
++++ b/src/fips.c
+@@ -593,22 +593,20 @@ run_random_selftests (void)
+ # endif
+ #define HMAC_LEN 32
+ 
+-static const unsigned char __attribute__ ((section (".rodata1")))
+-hmac_for_the_implementation[HMAC_LEN];
+-
+ /*
+- * In the ELF file opened as FP, determine the offset of the given
+- * virtual address ADDR and return it in R_OFFSET1.  Determine the
+- * offset of last loadable section in R_OFFSET2.  Rewinds FP to the
+- * beginning on success.
++ * In the ELF file opened as FP, fill the ELF header to the pointer
++ * EHDR_P, determine the offset of last loadable segment in R_OFFSET.
++ * Also, find the section which contains the hmac value and return it
++ * in HMAC.  Rewinds FP to the beginning on success.
+  */
+ static gpg_error_t
+-get_file_offsets (FILE *fp, unsigned long addr, ElfW (Ehdr) *ehdr_p,
+-                  unsigned long *r_offset1, unsigned long *r_offset2)
++get_file_offset (FILE *fp, ElfW (Ehdr) *ehdr_p,
++                 unsigned long *r_offset, unsigned char hmac[HMAC_LEN])
+ {
+   ElfW (Phdr) phdr;
+-  uint16_t e_phidx;
+-  long pos = 0;
++  ElfW (Shdr) shdr;
++  int i;
++  unsigned long off_segment = 0;
+ 
+   /* Read the ELF header */
+   if (fseek (fp, 0, SEEK_SET) != 0)
+@@ -616,12 +614,6 @@ get_file_offsets (FILE *fp, unsigned long addr, ElfW (Ehdr) *ehdr_p,
+   if (fread (ehdr_p, sizeof (*ehdr_p), 1, fp) != 1)
+     return gpg_error_from_syserror ();
+ 
+-  /* Fix up the ELF header, clean all section information.  */
+-  ehdr_p->e_shoff = 0;
+-  ehdr_p->e_shentsize = 0;
+-  ehdr_p->e_shnum = 0;
+-  ehdr_p->e_shstrndx = 0;
+-
+   /* The program header entry size should match the size of the phdr struct */
+   if (ehdr_p->e_phentsize != sizeof (phdr))
+     return gpg_error (GPG_ERR_INV_OBJ);
+@@ -632,11 +624,9 @@ get_file_offsets (FILE *fp, unsigned long addr, ElfW (Ehdr) *ehdr_p,
+   if (fseek (fp, ehdr_p->e_phoff, SEEK_SET) != 0)
+     return gpg_error_from_syserror ();
+ 
+-  /* Iterate over the program headers, compare their virtual addresses
+-     with the address we are looking for, and if the program header
+-     matches, calculate the offset of the given ADDR in the file using
+-     the program header's p_offset field.  */
+-  for (e_phidx = 0; e_phidx < ehdr_p->e_phnum; e_phidx++)
++  /* Iterate over the program headers, determine the last loadable
++     segment.  */
++  for (i = 0; i < ehdr_p->e_phnum; i++)
+     {
+       if (fread (&phdr, sizeof (phdr), 1, fp) != 1)
+         return gpg_error_from_syserror ();
+@@ -647,45 +637,100 @@ get_file_offsets (FILE *fp, unsigned long addr, ElfW (Ehdr) *ehdr_p,
+       if (phdr.p_type != PT_LOAD)
+         break;
+ 
+-      pos = phdr.p_offset + phdr.p_filesz;
+-      if (phdr.p_vaddr <= addr && addr < phdr.p_vaddr + phdr.p_memsz)
+-        /* Found segment, compute the offset of ADDR in the file */
+-        *r_offset1 = phdr.p_offset + (addr - phdr.p_vaddr);
++      off_segment = phdr.p_offset + phdr.p_filesz;
+     }
+ 
+-  if (*r_offset1)
++  if (!off_segment)
++    /* The segment not found in the file */
++    return gpg_error (GPG_ERR_INV_OBJ);
++
++  /* The section header entry size should match the size of the shdr struct */
++  if (ehdr_p->e_shentsize != sizeof (shdr))
++    return gpg_error (GPG_ERR_INV_OBJ);
++  if (ehdr_p->e_shoff == 0)
++    return gpg_error (GPG_ERR_INV_OBJ);
++
++  /* Jump to the first section header */
++  if (fseek (fp, ehdr_p->e_shoff, SEEK_SET) != 0)
++    return gpg_error_from_syserror ();
++
++  /* Iterate over the section headers, determine the note section,
++     read the hmac value.  */
++  for (i = 0; i < ehdr_p->e_shnum; i++)
+     {
+-      if (fseek (fp, 0, SEEK_SET) != 0)
++      long off;
++
++      if (fread (&shdr, sizeof (shdr), 1, fp) != 1)
+         return gpg_error_from_syserror ();
+ 
+-      *r_offset2 = (unsigned long)pos;
+-      return 0;
++      off = ftell (fp);
++      if (shdr.sh_type == SHT_NOTE && shdr.sh_flags == 0 && shdr.sh_size == 48)
++        {
++          const char header_of_the_note[] = {
++            0x04, 0x00, 0x00, 0x00,
++            0x20, 0x00, 0x00, 0x00,
++            0xca, 0xfe, 0x2a, 0x8e,
++            'F', 'D', 'O', 0x00
++          };
++          unsigned char header[16];
++
++          /* Jump to the note section.  */
++          if (fseek (fp, shdr.sh_offset, SEEK_SET) != 0)
++            return gpg_error_from_syserror ();
++
++          if (fread (header, sizeof (header), 1, fp) != 1)
++            return gpg_error_from_syserror ();
++
++          if (!memcmp (header, header_of_the_note, 16))
++            {
++              /* Found.  Read the hmac value into HMAC.  */
++              if (fread (hmac, HMAC_LEN, 1, fp) != 1)
++                return gpg_error_from_syserror ();
++              break;
++            }
++
++          /* Back to the next section header.  */
++          if (fseek (fp, off, SEEK_SET) != 0)
++            return gpg_error_from_syserror ();
++        }
+     }
+ 
+-  /* Segment not found in the file */
+-  return gpg_error (GPG_ERR_INV_OBJ);
++  if (i == ehdr_p->e_shnum)
++    /* The note section not found.  */
++    return gpg_error (GPG_ERR_INV_OBJ);
++
++  /* Fix up the ELF header, clean all section information.  */
++  ehdr_p->e_shoff = 0;
++  ehdr_p->e_shentsize = 0;
++  ehdr_p->e_shnum = 0;
++  ehdr_p->e_shstrndx = 0;
++
++  *r_offset = off_segment;
++  if (fseek (fp, 0, SEEK_SET) != 0)
++    return gpg_error_from_syserror ();
++
++  return 0;
+ }
+ 
+ static gpg_error_t
+-hmac256_check (const char *filename, const char *key, struct link_map *lm)
++hmac256_check (const char *filename, const char *key)
+ {
+   gpg_error_t err;
+   FILE *fp;
+   gcry_md_hd_t hd;
+-  size_t buffer_size, nread;
++  const size_t buffer_size = 32768;
++  size_t nread;
+   char *buffer;
+-  unsigned long addr;
+-  unsigned long offset1 = 0;
+-  unsigned long offset2 = 0;
++  unsigned long offset = 0;
+   unsigned long pos = 0;
+   ElfW (Ehdr) ehdr;
++  unsigned char hmac[HMAC_LEN];
+ 
+-  addr = (unsigned long)hmac_for_the_implementation - lm->l_addr;
+   fp = fopen (filename, "rb");
+   if (!fp)
+     return gpg_error (GPG_ERR_INV_OBJ);
+ 
+-  err = get_file_offsets (fp, addr, &ehdr, &offset1, &offset2);
++  err = get_file_offset (fp, &ehdr, &offset, hmac);
+   if (err)
+     {
+       fclose (fp);
+@@ -707,8 +752,7 @@ hmac256_check (const char *filename, const char *key, struct link_map *lm)
+       return err;
+     }
+ 
+-  buffer_size = 32768;
+-  buffer = xtrymalloc (buffer_size + HMAC_LEN);
++  buffer = xtrymalloc (buffer_size);
+   if (!buffer)
+     {
+       err = gpg_error_from_syserror ();
+@@ -717,38 +761,21 @@ hmac256_check (const char *filename, const char *key, struct link_map *lm)
+       return err;
+     }
+ 
+-  nread = fread (buffer, 1, HMAC_LEN, fp);
+-  pos += nread;
+-  if (nread < HMAC_LEN)
+-    {
+-      xfree (buffer);
+-      fclose (fp);
+-      _gcry_md_close (hd);
+-      return gpg_error (GPG_ERR_TOO_SHORT);
+-    }
+-
+   while (1)
+     {
+-      nread = fread (buffer+HMAC_LEN, 1, buffer_size, fp);
+-      if (pos + nread >= offset2)
+-        nread = offset2 - pos;
++      nread = fread (buffer, 1, buffer_size, fp);
++      if (pos + nread >= offset)
++        nread = offset - pos;
+ 
+-      /* Copy, fixed ELF header at the beginning.  */
+-      if (pos - HMAC_LEN == 0)
++      /* Copy the fixed ELF header at the beginning.  */
++      if (pos == 0)
+         memcpy (buffer, &ehdr, sizeof (ehdr));
+ 
++      _gcry_md_write (hd, buffer, nread);
++
+       if (nread < buffer_size)
+-        {
+-          if (pos - HMAC_LEN <= offset1 && offset1 <= pos + nread)
+-            memset (buffer + HMAC_LEN + offset1 - pos, 0, HMAC_LEN);
+-          _gcry_md_write (hd, buffer, nread+HMAC_LEN);
+-          break;
+-        }
++        break;
+ 
+-      if (pos - HMAC_LEN <= offset1 && offset1 <= pos + nread)
+-        memset (buffer + HMAC_LEN + offset1 - pos, 0, HMAC_LEN);
+-      _gcry_md_write (hd, buffer, nread);
+-      memcpy (buffer, buffer+buffer_size, HMAC_LEN);
+       pos += nread;
+     }
+ 
+@@ -759,7 +786,7 @@ hmac256_check (const char *filename, const char *key, struct link_map *lm)
+       unsigned char *digest;
+ 
+       digest = _gcry_md_read (hd, 0);
+-      if (!memcmp (digest, hmac_for_the_implementation, HMAC_LEN))
++      if (!memcmp (digest, hmac, HMAC_LEN))
+         /* Success.  */
+         err = 0;
+       else
+@@ -780,13 +807,11 @@ check_binary_integrity (void)
+   gpg_error_t err;
+   Dl_info info;
+   const char *key = KEY_FOR_BINARY_CHECK;
+-  void *extra_info;
+ 
+-  if (!dladdr1 (hmac_for_the_implementation, &info, &extra_info,
+-                RTLD_DL_LINKMAP))
++  if (!dladdr (hmac256_check, &info))
+     err = gpg_error_from_syserror ();
+   else
+-    err = hmac256_check (info.dli_fname, key, extra_info);
++    err = hmac256_check (info.dli_fname, key);
+ 
+   reporter ("binary", 0, NULL, err? gpg_strerror (err):NULL);
+ #ifdef HAVE_SYSLOG
+diff --git a/src/genhmac.sh b/src/gen-note-integrity.sh
+similarity index 78%
+rename from src/genhmac.sh
+rename to src/gen-note-integrity.sh
+index bb33b9c6..969fdca6 100755
+--- a/src/genhmac.sh
++++ b/src/gen-note-integrity.sh
+@@ -1,7 +1,7 @@
+ #! /bin/sh
+ 
+ #
+-# genhmac.sh - Build tool to generate hmac hash
++# gen-note-integrity.sh - Build tool to generate hmac hash section
+ #
+ # Copyright (C) 2022  g10 Code GmbH
+ #
+@@ -28,8 +28,40 @@ set -e
+ #
+ #   READELF
+ #   AWK
++#   ECHO_N
+ #
+ 
++######## Emit ElfN_Nhdr for note.fdo.integrity ########
++
++NOTE_NAME="FDO"
++
++# n_namesz = 4 including NUL
++printf '%b' '\004'
++printf '%b' '\000'
++printf '%b' '\000'
++printf '%b' '\000'
++
++# n_descsz = 32
++printf '%b' '\040'
++printf '%b' '\000'
++printf '%b' '\000'
++printf '%b' '\000'
++
++# n_type: NT_FDO_INTEGRITY=0xCAFE2A8E
++printf '%b' '\312'
++printf '%b' '\376'
++printf '%b' '\052'
++printf '%b' '\216'
++
++# the name
++echo $ECHO_N $NOTE_NAME
++printf '%b' '\000'
++
++# Here comes the alignment.  As the size of name is 4, it's none.
++# NO PADDING HERE.
++
++######## Rest is to generate hmac hash ########
++
+ AWK_VERSION_OUTPUT=$($AWK 'BEGIN { print PROCINFO["version"] }')
+ if test -n "$AWK_VERSION_OUTPUT"; then
+     # It's GNU awk, which supports PROCINFO.
+-- 
+2.39.1
+
+
