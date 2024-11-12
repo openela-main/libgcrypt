@@ -1,0 +1,2249 @@
+From a611e3a25d61505698e2bb38ec2db38bc6a74820 Mon Sep 17 00:00:00 2001
+From: NIIBE Yutaka <gniibe@fsij.org>
+Date: Tue, 10 May 2022 15:44:19 +0900
+Subject: [PATCH] mpi: Fix for 64-bit for _gcry_mpih_cmp_ui.
+
+* mpi/mpih-const-time.c (_gcry_mpih_cmp_ui): Compare 64-bit
+value correctly.
+
+--
+
+Reported-by: Guido Vranken <guidovranken@gmail.com>
+GnuPG-bug-id: 5970
+Signed-off-by: NIIBE Yutaka <gniibe@fsij.org>
+---
+ mpi/mpih-const-time.c | 9 ++++++++-
+ 1 file changed, 8 insertions(+), 1 deletion(-)
+
+diff --git a/mpi/mpih-const-time.c b/mpi/mpih-const-time.c
+index b527ad79..9d74d190 100644
+--- a/mpi/mpih-const-time.c
++++ b/mpi/mpih-const-time.c
+@@ -204,6 +204,13 @@ _gcry_mpih_cmp_ui (mpi_ptr_t up, mpi_size_t usize, unsigned long v)
+     is_all_zero &= (up[i] == 0);
+ 
+   if (is_all_zero)
+-    return up[0] - v;
++    {
++      if (up[0] < v)
++        return -1;
++      else if (up[0] > v)
++        return 1;
++      else
++        return 0;
++    }
+   return 1;
+ }
+-- 
+2.44.0
+
+From 34c20427926010d6fa95b1666e4b1b60f60a8742 Mon Sep 17 00:00:00 2001
+From: NIIBE Yutaka <gniibe@fsij.org>
+Date: Fri, 27 Oct 2023 14:03:40 +0900
+Subject: [PATCH] rsa: Fix decoding of PKCS#1 v1.5 and OAEP padding.
+
+* src/Makefile.am (libgcrypt_la_SOURCES): Add const-time.h and
+const-time.c.
+* src/const-time.h (ct_not_equal_byte, sexp_null_cond): New.
+(ct_memequal): New from NetBSD, modified return type and name.
+* src/const-time.c: New.
+* cipher/rsa-common.c (_gcry_rsa_pkcs1_decode_for_enc): Examine whole
+sequence of the byte-array.  Use N0 to find the separator position, with
+ct_not_equal_byte.  Return the MPI even when the case of an error.
+* cipher/rsa-common.c (_gcry_rsa_oaep_decode): Use ct_memequal to
+check LHASH.  Examine all the sequence of the byte-array.  Use N1 to
+find the separator of 0x01.  Return the MPI even when the case of an
+error.
+* cipher/rsa.c (rsa_decrypt): Always build a SEXP.
+
+--
+
+Note: For architecture(s) which may result branch in comparison of
+byte, configure script should emit POSSIBLE_BRANCH_IN_BYTE_COMPARISON.
+
+Reported-by: Hubert Kario <hkario@redhat.com>
+Signed-off-by: NIIBE Yutaka <gniibe@fsij.org>
+---
+ cipher/rsa-common.c | 72 +++++++++++++++++++++------------------------
+ cipher/rsa.c        | 15 +++++++---
+ src/Makefile.am     |  2 +-
+ src/const-time.c    | 51 ++++++++++++++++++++++++++++++++
+ src/const-time.h    | 53 +++++++++++++++++++++++++++++++++
+ 5 files changed, 149 insertions(+), 44 deletions(-)
+ create mode 100644 src/const-time.c
+ create mode 100644 src/const-time.h
+
+diff --git a/cipher/rsa-common.c b/cipher/rsa-common.c
+index dd654c39..bd6d4bd6 100644
+--- a/cipher/rsa-common.c
++++ b/cipher/rsa-common.c
+@@ -27,6 +27,7 @@
+ #include "mpi.h"
+ #include "cipher.h"
+ #include "pubkey-internal.h"
++#include "const-time.h"
+ 
+ 
+ /* Turn VALUE into an octet string and store it in an allocated buffer
+@@ -172,7 +173,9 @@ _gcry_rsa_pkcs1_decode_for_enc (unsigned char **r_result, size_t *r_resultlen,
+   gcry_error_t err;
+   unsigned char *frame = NULL;
+   size_t nframe = (nbits+7) / 8;
+-  size_t n;
++  size_t n, n0;
++  unsigned int failed = 0;
++  unsigned int not_found = 1;
+ 
+   *r_result = NULL;
+ 
+@@ -203,33 +206,31 @@ _gcry_rsa_pkcs1_decode_for_enc (unsigned char **r_result, size_t *r_resultlen,
+   n = 0;
+   if (!frame[0])
+     n++;
+-  if (frame[n++] != 0x02)
+-    {
+-      xfree (frame);
+-      return GPG_ERR_ENCODING_PROBLEM;  /* Wrong block type.  */
+-    }
++  failed |= ct_not_equal_byte (frame[n++], 0x02);
+ 
+-  /* Skip the non-zero random bytes and the terminating zero byte.  */
+-  for (; n < nframe && frame[n] != 0x00; n++)
+-    ;
+-  if (n+1 >= nframe)
++  /* Find the terminating zero byte.  */
++  n0 = n;
++  for (; n < nframe; n++)
+     {
+-      xfree (frame);
+-      return GPG_ERR_ENCODING_PROBLEM; /* No zero byte.  */
++      not_found &= ct_not_equal_byte (frame[n], 0x00);
++      n0 += not_found;
+     }
+-  n++; /* Skip the zero byte.  */
++
++  failed |= not_found;
++  n0 += !not_found; /* Skip the zero byte.  */
+ 
+   /* To avoid an extra allocation we reuse the frame buffer.  The only
+      caller of this function will anyway free the result soon.  */
+-  memmove (frame, frame + n, nframe - n);
++  memmove (frame, frame + n0, nframe - n0);
++
+   *r_result = frame;
+-  *r_resultlen = nframe - n;
++  *r_resultlen = nframe - n0;
+ 
+   if (DBG_CIPHER)
+     log_printhex ("value extracted from PKCS#1 block type 2 encoded data",
+                   *r_result, *r_resultlen);
+ 
+-  return 0;
++  return (0U - failed) & GPG_ERR_ENCODING_PROBLEM;
+ }
+ 
+ 
+@@ -616,7 +617,8 @@ _gcry_rsa_oaep_decode (unsigned char **r_result, size_t *r_resultlen,
+   size_t db_len;               /* Length of DB and masked_db.  */
+   size_t nkey = (nbits+7)/8;   /* Length of the key in bytes.  */
+   int failed = 0;              /* Error indicator.  */
+-  size_t n;
++  size_t n, n1;
++  unsigned int not_found = 1;
+ 
+   *r_result = NULL;
+ 
+@@ -688,51 +690,43 @@ _gcry_rsa_oaep_decode (unsigned char **r_result, size_t *r_resultlen,
+   db_len      = nframe - 1 - hlen;
+ 
+   /* Step 3c and 3d: seed = maskedSeed ^ mgf(maskedDB, hlen).  */
+-  if (mgf1 (seed, hlen, masked_db, db_len, algo))
+-    failed = 1;
++  failed |= (mgf1 (seed, hlen, masked_db, db_len, algo) != 0);
+   for (n = 0; n < hlen; n++)
+     seed[n] ^= masked_seed[n];
+ 
+   /* Step 3e and 3f: db = maskedDB ^ mgf(seed, db_len).  */
+-  if (mgf1 (db, db_len, seed, hlen, algo))
+-    failed = 1;
++  failed |= (mgf1 (db, db_len, seed, hlen, algo) != 0);
+   for (n = 0; n < db_len; n++)
+     db[n] ^= masked_db[n];
+ 
+   /* Step 3g: Check lhash, an possible empty padding string terminated
+      by 0x01 and the first byte of EM being 0.  */
+-  if (memcmp (lhash, db, hlen))
+-    failed = 1;
+-  for (n = hlen; n < db_len; n++)
+-    if (db[n] == 0x01)
+-      break;
+-  if (n == db_len)
+-    failed = 1;
+-  if (frame[0])
+-    failed = 1;
++  failed |= !ct_memequal (lhash, db, hlen);
++  for (n = n1 = hlen; n < db_len; n++)
++    {
++      not_found &= ct_not_equal_byte (db[n], 0x01);
++      n1 += not_found;
++    }
++  failed |= not_found;
++  failed |= ct_not_equal_byte (frame[0], 0x00);
+ 
+   xfree (lhash);
+   xfree (frame);
+-  if (failed)
+-    {
+-      xfree (seed);
+-      return GPG_ERR_ENCODING_PROBLEM;
+-    }
+ 
+   /* Step 4: Output M.  */
+   /* To avoid an extra allocation we reuse the seed buffer.  The only
+      caller of this function will anyway free the result soon.  */
+-  n++;
+-  memmove (seed, db + n, db_len - n);
++  n1 += !not_found;
++  memmove (seed, db + n1, db_len - n1);
+   *r_result = seed;
+-  *r_resultlen = db_len - n;
++  *r_resultlen = db_len - n1;
+   seed = NULL;
+ 
+   if (DBG_CIPHER)
+     log_printhex ("value extracted from OAEP encoded data",
+                   *r_result, *r_resultlen);
+ 
+-  return 0;
++  return (0U - failed) & GPG_ERR_ENCODING_PROBLEM;
+ }
+ 
+ 
+diff --git a/cipher/rsa.c b/cipher/rsa.c
+index 45523e6b..ffa1aabd 100644
+--- a/cipher/rsa.c
++++ b/cipher/rsa.c
+@@ -33,6 +33,7 @@
+ #include "mpi.h"
+ #include "cipher.h"
+ #include "pubkey-internal.h"
++#include "const-time.h"
+ 
+ 
+ typedef struct
+@@ -1444,6 +1445,8 @@ rsa_decrypt (gcry_sexp_t *r_plain, gcry_sexp_t s_data, gcry_sexp_t keyparms)
+   unsigned char *unpad = NULL;
+   size_t unpadlen = 0;
+   unsigned int nbits = rsa_get_nbits (keyparms);
++  gcry_sexp_t result = NULL;
++  gcry_sexp_t dummy = NULL;
+ 
+   rc = rsa_check_keysize (nbits);
+   if (rc)
+@@ -1512,8 +1515,10 @@ rsa_decrypt (gcry_sexp_t *r_plain, gcry_sexp_t s_data, gcry_sexp_t keyparms)
+       rc = _gcry_rsa_pkcs1_decode_for_enc (&unpad, &unpadlen, nbits, plain);
+       mpi_free (plain);
+       plain = NULL;
+-      if (!rc)
+-        rc = sexp_build (r_plain, NULL, "(value %b)", (int)unpadlen, unpad);
++      sexp_build (&result, NULL, "(value %b)", (int)unpadlen, unpad);
++      *r_plain = sexp_null_cond (result, !!rc);
++      dummy = sexp_null_cond (result, !rc);
++      sexp_release (dummy);
+       break;
+ 
+     case PUBKEY_ENC_OAEP:
+@@ -1522,8 +1527,10 @@ rsa_decrypt (gcry_sexp_t *r_plain, gcry_sexp_t s_data, gcry_sexp_t keyparms)
+                                   plain, ctx.label, ctx.labellen);
+       mpi_free (plain);
+       plain = NULL;
+-      if (!rc)
+-        rc = sexp_build (r_plain, NULL, "(value %b)", (int)unpadlen, unpad);
++      sexp_build (&result, NULL, "(value %b)", (int)unpadlen, unpad);
++      *r_plain = sexp_null_cond (result, !!rc);
++      dummy = sexp_null_cond (result,!rc);
++      sexp_release (dummy);
+       break;
+ 
+     default:
+diff --git a/src/Makefile.am b/src/Makefile.am
+index 5e003bf0..f6191bc8 100644
+--- a/src/Makefile.am
++++ b/src/Makefile.am
+@@ -63,7 +63,7 @@ libgcrypt_la_SOURCES = \
+ 	misc.c global.c sexp.c hwfeatures.c hwf-common.h \
+ 	stdmem.c stdmem.h secmem.c secmem.h \
+ 	mpi.h missing-string.c fips.c \
+-	context.c context.h \
++	context.c context.h const-time.h const-time.c \
+ 	ec-context.h
+ 
+ EXTRA_libgcrypt_la_SOURCES = hwf-x86.c hwf-arm.c hwf-ppc.c hwf-s390x.c
+diff --git a/src/const-time.c b/src/const-time.c
+new file mode 100644
+index 00000000..7e56f210
+--- /dev/null
++++ b/src/const-time.c
+@@ -0,0 +1,51 @@
++/* const-time.c  -  Constant-time functions
++ *      Copyright (C) 2023  g10 Code GmbH
++ *
++ * This file is part of Libgcrypt.
++ *
++ * Libgcrypt is free software; you can redistribute it and/or modify
++ * it under the terms of the GNU Lesser General Public License as
++ * published by the Free Software Foundation; either version 2.1 of
++ * the License, or (at your option) any later version.
++ *
++ * Libgcrypt is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++ * GNU Lesser General Public License for more details.
++ *
++ * You should have received a copy of the GNU Lesser General Public
++ * License along with this program; if not, see <https://www.gnu.org/licenses/>.
++ */
++
++#include <config.h>
++#include <stdio.h>
++#include <stdlib.h>
++#include "g10lib.h"
++
++/* Originally in NetBSD.
++ *
++ * Written by Matthias Drochner <drochner@NetBSD.org>.
++ * Public domain.
++ *
++ * Modified the function name and return type to unsigned.
++ */
++unsigned int
++ct_memequal (const void *b1, const void *b2, size_t len)
++{
++	const unsigned char *c1 = b1, *c2 = b2;
++	unsigned int res = 0;
++
++	while (len--)
++		res |= *c1++ ^ *c2++;
++
++	/*
++	 * Map 0 to 1 and [1, 256) to 0 using only constant-time
++	 * arithmetic.
++	 *
++	 * This is not simply `!res' because although many CPUs support
++	 * branchless conditional moves and many compilers will take
++	 * advantage of them, certain compilers generate branches on
++	 * certain CPUs for `!res'.
++	 */
++	return (1 & ((res - 1) >> 8));
++}
+diff --git a/src/const-time.h b/src/const-time.h
+new file mode 100644
+index 00000000..2055ef16
+--- /dev/null
++++ b/src/const-time.h
+@@ -0,0 +1,53 @@
++/* const-time.h  -  Constant-time functions
++ *      Copyright (C) 2023  g10 Code GmbH
++ *
++ * This file is part of Libgcrypt.
++ *
++ * Libgcrypt is free software; you can redistribute it and/or modify
++ * it under the terms of the GNU Lesser General Public License as
++ * published by the Free Software Foundation; either version 2.1 of
++ * the License, or (at your option) any later version.
++ *
++ * Libgcrypt is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++ * GNU Lesser General Public License for more details.
++ *
++ * You should have received a copy of the GNU Lesser General Public
++ * License along with this program; if not, see <https://www.gnu.org/licenses/>.
++ */
++
++/*
++ * Return 1 if it's not same, 0 if same.
++ */
++static inline unsigned int
++ct_not_equal_byte (unsigned char b0, unsigned char b1)
++{
++#ifdef POSSIBLE_BRANCH_IN_BYTE_COMPARISON
++  unsigned int diff;
++
++  diff = b0;
++  diff ^= b1;
++
++  return (0U - diff) >> (sizeof (unsigned int)*8 - 1);
++#else
++  return b0 != b1;
++#endif
++}
++
++/*
++ *  Return NULL when OP_ENABLED=1
++ *  otherwise, return W
++ */
++static inline gcry_sexp_t
++sexp_null_cond (gcry_sexp_t w, unsigned long op_enable)
++{
++  static volatile uintptr_t vone = 1;
++  size_t mask = (uintptr_t)op_enable - vone;
++
++  return (gcry_sexp_t)(void *)((uintptr_t)w & mask);
++}
++
++/* Compare byte-arrays of length LEN, return 1 if it's same, 0 otherwise.
++   We use pointer of void *, so that it can be used with any structure.  */
++unsigned int ct_memequal (const void *b1, const void *b2, size_t len);
+-- 
+2.44.0
+
+From c848459e512615c1865a23cf24debb3ad4a1e85b Mon Sep 17 00:00:00 2001
+From: NIIBE Yutaka <gniibe@fsij.org>
+Date: Mon, 30 Oct 2023 10:28:28 +0900
+Subject: [PATCH] build: Check if arch is VAX or compiler is MSVC.
+
+* configure.ac (AH_BOTTOM): Add check for VAX and MSVC.
+* src/const-time.h (POSSIBLE_CONDITIONAL_BRANCH_IN_BYTE_COMPARISON):
+Rename.
+
+--
+
+Signed-off-by: NIIBE Yutaka <gniibe@fsij.org>
+---
+ configure.ac     | 5 +++++
+ src/const-time.h | 2 +-
+ 2 files changed, 6 insertions(+), 1 deletion(-)
+
+diff --git a/configure.ac b/configure.ac
+index 4f7c3a52..09c93289 100644
+--- a/configure.ac
++++ b/configure.ac
+@@ -121,6 +121,11 @@ AH_BOTTOM([
+    properly prefixed.  */
+ #define CAMELLIA_EXT_SYM_PREFIX _gcry_
+ 
++/* For some architectures or a specific compiler vendor, we need
++   to care about possible conditional branch in byte comparison.  */
++#if defined(__vax__) || defined(_MSC_VER)
++# define POSSIBLE_CONDITIONAL_BRANCH_IN_BYTE_COMPARISON 1
++#endif
+ #endif /*_GCRYPT_CONFIG_H_INCLUDED*/
+ ])
+ 
+diff --git a/src/const-time.h b/src/const-time.h
+index 2055ef16..9fc19779 100644
+--- a/src/const-time.h
++++ b/src/const-time.h
+@@ -23,7 +23,7 @@
+ static inline unsigned int
+ ct_not_equal_byte (unsigned char b0, unsigned char b1)
+ {
+-#ifdef POSSIBLE_BRANCH_IN_BYTE_COMPARISON
++#ifdef POSSIBLE_CONDITIONAL_BRANCH_IN_BYTE_COMPARISON
+   unsigned int diff;
+ 
+   diff = b0;
+-- 
+2.44.0
+
+From c31b70b2660c3d24bd54ee08c255c36d867fdea7 Mon Sep 17 00:00:00 2001
+From: NIIBE Yutaka <gniibe@fsij.org>
+Date: Mon, 30 Oct 2023 14:02:42 +0900
+Subject: [PATCH] const-time: Use ct_not_memequal, instead.  Tested with AVR.
+
+* cipher/rsa-common.c (_gcry_rsa_oaep_decode): Use ct_not_memequal.
+* src/const-time.c (ct_not_memequal): Use ct_not_equal_byte.
+* src/const-time.h (ct_not_memequal): Rename from ct_memequal.
+
+--
+
+Signed-off-by: NIIBE Yutaka <gniibe@fsij.org>
+---
+ cipher/rsa-common.c |  2 +-
+ configure.ac        |  2 +-
+ src/const-time.c    | 35 ++++++++++++++++-------------------
+ src/const-time.h    |  7 ++++---
+ 4 files changed, 22 insertions(+), 24 deletions(-)
+
+diff --git a/cipher/rsa-common.c b/cipher/rsa-common.c
+index bd6d4bd6..24f90e01 100644
+--- a/cipher/rsa-common.c
++++ b/cipher/rsa-common.c
+@@ -701,7 +701,7 @@ _gcry_rsa_oaep_decode (unsigned char **r_result, size_t *r_resultlen,
+ 
+   /* Step 3g: Check lhash, an possible empty padding string terminated
+      by 0x01 and the first byte of EM being 0.  */
+-  failed |= !ct_memequal (lhash, db, hlen);
++  failed |= ct_not_memequal (lhash, db, hlen);
+   for (n = n1 = hlen; n < db_len; n++)
+     {
+       not_found &= ct_not_equal_byte (db[n], 0x01);
+diff --git a/configure.ac b/configure.ac
+index 09c93289..aead8347 100644
+--- a/configure.ac
++++ b/configure.ac
+@@ -123,7 +123,7 @@ AH_BOTTOM([
+ 
+ /* For some architectures or a specific compiler vendor, we need
+    to care about possible conditional branch in byte comparison.  */
+-#if defined(__vax__) || defined(_MSC_VER)
++#if defined(__vax__) || defined(AVR) || defined(_MSC_VER)
+ # define POSSIBLE_CONDITIONAL_BRANCH_IN_BYTE_COMPARISON 1
+ #endif
+ #endif /*_GCRYPT_CONFIG_H_INCLUDED*/
+diff --git a/src/const-time.c b/src/const-time.c
+index 7e56f210..e66fee92 100644
+--- a/src/const-time.c
++++ b/src/const-time.c
+@@ -21,31 +21,28 @@
+ #include <stdio.h>
+ #include <stdlib.h>
+ #include "g10lib.h"
++#include "const-time.h"
+ 
+-/* Originally in NetBSD.
++/*
++ * Compare byte arrays of length LEN, return 1 if it's not same,
++ * 0, otherwise.
+  *
+- * Written by Matthias Drochner <drochner@NetBSD.org>.
+- * Public domain.
++ * Originally in NetBSD as "consttime_memequal" which is:
+  *
+- * Modified the function name and return type to unsigned.
++ *   Written by Matthias Drochner <drochner@NetBSD.org>.
++ *   Public domain.
++ *
++ * Modified the function name, return type to unsigned,
++ * and return value (0 <-> 1).
+  */
+ unsigned int
+-ct_memequal (const void *b1, const void *b2, size_t len)
++ct_not_memequal (const void *b1, const void *b2, size_t len)
+ {
+-	const unsigned char *c1 = b1, *c2 = b2;
+-	unsigned int res = 0;
++  const unsigned char *c1 = b1, *c2 = b2;
++  unsigned int res = 0;
+ 
+-	while (len--)
+-		res |= *c1++ ^ *c2++;
++  while (len--)
++    res |= *c1++ ^ *c2++;
+ 
+-	/*
+-	 * Map 0 to 1 and [1, 256) to 0 using only constant-time
+-	 * arithmetic.
+-	 *
+-	 * This is not simply `!res' because although many CPUs support
+-	 * branchless conditional moves and many compilers will take
+-	 * advantage of them, certain compilers generate branches on
+-	 * certain CPUs for `!res'.
+-	 */
+-	return (1 & ((res - 1) >> 8));
++  return ct_not_equal_byte (res, 0);
+ }
+diff --git a/src/const-time.h b/src/const-time.h
+index 9fc19779..b8add29d 100644
+--- a/src/const-time.h
++++ b/src/const-time.h
+@@ -48,6 +48,7 @@ sexp_null_cond (gcry_sexp_t w, unsigned long op_enable)
+   return (gcry_sexp_t)(void *)((uintptr_t)w & mask);
+ }
+ 
+-/* Compare byte-arrays of length LEN, return 1 if it's same, 0 otherwise.
+-   We use pointer of void *, so that it can be used with any structure.  */
+-unsigned int ct_memequal (const void *b1, const void *b2, size_t len);
++/* Compare byte-arrays of length LEN, return 1 if it's not same, 0
++   otherwise.  We use pointer of void *, so that it can be used with
++   any structure.  */
++unsigned int ct_not_memequal (const void *b1, const void *b2, size_t len);
+-- 
+2.44.0
+
+From bd08357436a9559766cd458d25781ee4f94012a2 Mon Sep 17 00:00:00 2001
+From: NIIBE Yutaka <gniibe@fsij.org>
+Date: Tue, 31 Oct 2023 13:43:29 +0900
+Subject: [PATCH] const-time: Add ct_memmov_cond, fix _gcry_mpih_set_cond.
+
+* src/const-time.c (ct_memmov_cond): New.
+* src/const-time.h (ct_memmov_cond): New.
+* mpi/mpih-const-time.c (_gcry_mpih_set_cond): Use XOR and a MASK.
+
+--
+
+ct_memmov_cond is like memcpy, but it allows use with overlapping
+memory area when DST <= SRC.  It's not like memmove because it doesn't
+allow overlapping memory area when DST > SRC.
+
+Signed-off-by: NIIBE Yutaka <gniibe@fsij.org>
+---
+ mpi/mpih-const-time.c |  7 ++-----
+ src/const-time.c      | 19 +++++++++++++++++++
+ src/const-time.h      | 16 ++++++++++++----
+ 3 files changed, 33 insertions(+), 9 deletions(-)
+
+diff --git a/mpi/mpih-const-time.c b/mpi/mpih-const-time.c
+index 9d74d190..3f0440a9 100644
+--- a/mpi/mpih-const-time.c
++++ b/mpi/mpih-const-time.c
+@@ -40,13 +40,10 @@ _gcry_mpih_set_cond (mpi_ptr_t wp, mpi_ptr_t up, mpi_size_t usize,
+                      unsigned long op_enable)
+ {
+   mpi_size_t i;
+-  mpi_limb_t mask1 = vzero - op_enable;
+-  mpi_limb_t mask2 = op_enable - vone;
++  mpi_limb_t mask = vzero - op_enable;
+ 
+   for (i = 0; i < usize; i++)
+-    {
+-      wp[i] = (wp[i] & mask2) | (up[i] & mask1);
+-    }
++    wp[i] ^= mask & (wp[i] ^ up[i]);
+ }
+ 
+ 
+diff --git a/src/const-time.c b/src/const-time.c
+index e66fee92..400af993 100644
+--- a/src/const-time.c
++++ b/src/const-time.c
+@@ -46,3 +46,22 @@ ct_not_memequal (const void *b1, const void *b2, size_t len)
+ 
+   return ct_not_equal_byte (res, 0);
+ }
++
++/*
++ * Copy LEN bytes from memory area SRC to memory area DST, when
++ * OP_ENABLED=1.  When DST <= SRC, the memory areas may overlap.  When
++ * DST > SRC, the memory areas must not overlap.
++ */
++void
++ct_memmov_cond (void *dst, const void *src, size_t len,
++                unsigned long op_enable)
++{
++  size_t i;
++  unsigned char mask;
++  unsigned char *b_dst = dst;
++  const unsigned char *b_src = src;
++
++  mask = -(unsigned char)op_enable;
++  for (i = 0; i < len; i++)
++    b_dst[i] ^= mask & (b_dst[i] ^ b_src[i]);
++}
+diff --git a/src/const-time.h b/src/const-time.h
+index b8add29d..53d7dd2a 100644
+--- a/src/const-time.h
++++ b/src/const-time.h
+@@ -35,6 +35,11 @@ ct_not_equal_byte (unsigned char b0, unsigned char b1)
+ #endif
+ }
+ 
++/* Compare byte-arrays of length LEN, return 1 if it's not same, 0
++   otherwise.  We use pointer of void *, so that it can be used with
++   any structure.  */
++unsigned int ct_not_memequal (const void *b1, const void *b2, size_t len);
++
+ /*
+  *  Return NULL when OP_ENABLED=1
+  *  otherwise, return W
+@@ -48,7 +53,10 @@ sexp_null_cond (gcry_sexp_t w, unsigned long op_enable)
+   return (gcry_sexp_t)(void *)((uintptr_t)w & mask);
+ }
+ 
+-/* Compare byte-arrays of length LEN, return 1 if it's not same, 0
+-   otherwise.  We use pointer of void *, so that it can be used with
+-   any structure.  */
+-unsigned int ct_not_memequal (const void *b1, const void *b2, size_t len);
++/*
++ * Copy LEN bytes from memory area SRC to memory area DST, when
++ * OP_ENABLED=1.  When DST <= SRC, the memory areas may overlap.  When
++ * DST > SRC, the memory areas must not overlap.
++ */
++void ct_memmov_cond (void *dst, const void *src, size_t len,
++                     unsigned long op_enable);
+-- 
+2.44.0
+
+From 58b62be844549ad3d57c507d834027f1e2756567 Mon Sep 17 00:00:00 2001
+From: NIIBE Yutaka <gniibe@fsij.org>
+Date: Tue, 31 Oct 2023 14:46:42 +0900
+Subject: [PATCH] rsa: Use memmov_independently when unpadding.
+
+* cipher/rsa-common.c (memmov_independently): New.
+(_gcry_rsa_pkcs1_decode_for_enc): Use memmov_independently.
+(_gcry_rsa_oaep_decode): Use memmov_independently.
+
+--
+
+Signed-off-by: NIIBE Yutaka <gniibe@fsij.org>
+---
+ cipher/rsa-common.c | 33 +++++++++++++++++++++++++++++++--
+ 1 file changed, 31 insertions(+), 2 deletions(-)
+
+diff --git a/cipher/rsa-common.c b/cipher/rsa-common.c
+index 24f90e01..74eb6341 100644
+--- a/cipher/rsa-common.c
++++ b/cipher/rsa-common.c
+@@ -162,6 +162,35 @@ _gcry_rsa_pkcs1_encode_for_enc (gcry_mpi_t *r_result, unsigned int nbits,
+ }
+ 
+ 
++/*
++ *                    <--len-->
++ * DST-------v       v-------------SRC
++ *           [.................]
++ *            <---- buflen --->
++ *
++ * Copy the memory area SRC with LEN into another memory area DST.
++ * Conditions met:
++ *         the address SRC > DST
++ *         DST + BUFLEN == SRC + LEN.
++ *
++ * Memory access doesn't depends on LEN, but always done independently,
++ * sliding memory area by 1, 2, 4 ... until done.
++ */
++static void
++memmov_independently (void *dst, const void *src, size_t len, size_t buflen)
++{
++  size_t offset = (size_t)((char *)src - (char *)dst);
++  size_t shift;
++
++  (void)len; /* No dependency.  */
++  for (shift = 1; shift < buflen; shift <<= 1)
++    {
++      ct_memmov_cond (dst, (char *)dst + shift, buflen - shift, (offset&1));
++      offset >>= 1;
++    }
++}
++
++
+ /* Decode a plaintext in VALUE assuming pkcs#1 block type 2 padding.
+    NBITS is the size of the secret key.  On success the result is
+    stored as a newly allocated buffer at R_RESULT and its valid length at
+@@ -221,7 +250,7 @@ _gcry_rsa_pkcs1_decode_for_enc (unsigned char **r_result, size_t *r_resultlen,
+ 
+   /* To avoid an extra allocation we reuse the frame buffer.  The only
+      caller of this function will anyway free the result soon.  */
+-  memmove (frame, frame + n0, nframe - n0);
++  memmov_independently (frame, frame + n0, nframe - n0, nframe);
+ 
+   *r_result = frame;
+   *r_resultlen = nframe - n0;
+@@ -717,7 +746,7 @@ _gcry_rsa_oaep_decode (unsigned char **r_result, size_t *r_resultlen,
+   /* To avoid an extra allocation we reuse the seed buffer.  The only
+      caller of this function will anyway free the result soon.  */
+   n1 += !not_found;
+-  memmove (seed, db + n1, db_len - n1);
++  memmov_independently (seed, db + n1, db_len - n1, nframe - 1);
+   *r_result = seed;
+   *r_resultlen = db_len - n1;
+   seed = NULL;
+-- 
+2.44.0
+
+From 6d1d50ba3aad1850975f717adbedb4cb8b236fa7 Mon Sep 17 00:00:00 2001
+From: NIIBE Yutaka <gniibe@fsij.org>
+Date: Tue, 31 Oct 2023 15:09:25 +0900
+Subject: [PATCH] cipher: Fix ElGamal decryption.
+
+* cipher/elgamal.c (elg_decrypt): Call sexp_build always.
+* cipher/rsa.c (rsa_decrypt): Return an error code of sexp_build
+when RC != 0.
+
+Signed-off-by: NIIBE Yutaka <gniibe@fsij.org>
+---
+ cipher/elgamal.c | 21 ++++++++++++++++-----
+ cipher/rsa.c     | 10 +++++++---
+ 2 files changed, 23 insertions(+), 8 deletions(-)
+
+diff --git a/cipher/elgamal.c b/cipher/elgamal.c
+index eead4502..06881cb6 100644
+--- a/cipher/elgamal.c
++++ b/cipher/elgamal.c
+@@ -31,6 +31,7 @@
+ #include "mpi.h"
+ #include "cipher.h"
+ #include "pubkey-internal.h"
++#include "const-time.h"
+ 
+ 
+ /* Blinding is used to mitigate side-channel attacks.  You may undef
+@@ -872,7 +873,7 @@ elg_encrypt (gcry_sexp_t *r_ciph, gcry_sexp_t s_data, gcry_sexp_t keyparms)
+ static gcry_err_code_t
+ elg_decrypt (gcry_sexp_t *r_plain, gcry_sexp_t s_data, gcry_sexp_t keyparms)
+ {
+-  gpg_err_code_t rc;
++  gpg_err_code_t rc, rc_sexp;
+   struct pk_encoding_ctx ctx;
+   gcry_sexp_t l1 = NULL;
+   gcry_mpi_t data_a = NULL;
+@@ -881,6 +882,8 @@ elg_decrypt (gcry_sexp_t *r_plain, gcry_sexp_t s_data, gcry_sexp_t keyparms)
+   gcry_mpi_t plain = NULL;
+   unsigned char *unpad = NULL;
+   size_t unpadlen = 0;
++  gcry_sexp_t result = NULL;
++  gcry_sexp_t dummy = NULL;
+ 
+   _gcry_pk_util_init_encoding_ctx (&ctx, PUBKEY_OP_DECRYPT,
+                                    elg_get_nbits (keyparms));
+@@ -929,8 +932,12 @@ elg_decrypt (gcry_sexp_t *r_plain, gcry_sexp_t s_data, gcry_sexp_t keyparms)
+     case PUBKEY_ENC_PKCS1:
+       rc = _gcry_rsa_pkcs1_decode_for_enc (&unpad, &unpadlen, ctx.nbits, plain);
+       mpi_free (plain); plain = NULL;
+-      if (!rc)
+-        rc = sexp_build (r_plain, NULL, "(value %b)", (int)unpadlen, unpad);
++      rc_sexp = sexp_build (&result, NULL, "(value %b)", (int)unpadlen, unpad);
++      *r_plain = sexp_null_cond (result, !!rc);
++      dummy = sexp_null_cond (result, !rc);
++      sexp_release (dummy);
++      if (!rc && rc_sexp)
++        rc = rc_sexp;
+       break;
+ 
+     case PUBKEY_ENC_OAEP:
+@@ -938,8 +945,12 @@ elg_decrypt (gcry_sexp_t *r_plain, gcry_sexp_t s_data, gcry_sexp_t keyparms)
+                                   ctx.nbits, ctx.hash_algo, plain,
+                                   ctx.label, ctx.labellen);
+       mpi_free (plain); plain = NULL;
+-      if (!rc)
+-        rc = sexp_build (r_plain, NULL, "(value %b)", (int)unpadlen, unpad);
++      rc_sexp = sexp_build (&result, NULL, "(value %b)", (int)unpadlen, unpad);
++      *r_plain = sexp_null_cond (result, !!rc);
++      dummy = sexp_null_cond (result, !rc);
++      sexp_release (dummy);
++      if (!rc && rc_sexp)
++        rc = rc_sexp;
+       break;
+ 
+     default:
+diff --git a/cipher/rsa.c b/cipher/rsa.c
+index ffa1aabd..383e2474 100644
+--- a/cipher/rsa.c
++++ b/cipher/rsa.c
+@@ -1436,7 +1436,7 @@ static gcry_err_code_t
+ rsa_decrypt (gcry_sexp_t *r_plain, gcry_sexp_t s_data, gcry_sexp_t keyparms)
+ 
+ {
+-  gpg_err_code_t rc;
++  gpg_err_code_t rc, rc_sexp;
+   struct pk_encoding_ctx ctx;
+   gcry_sexp_t l1 = NULL;
+   gcry_mpi_t data = NULL;
+@@ -1515,10 +1515,12 @@ rsa_decrypt (gcry_sexp_t *r_plain, gcry_sexp_t s_data, gcry_sexp_t keyparms)
+       rc = _gcry_rsa_pkcs1_decode_for_enc (&unpad, &unpadlen, nbits, plain);
+       mpi_free (plain);
+       plain = NULL;
+-      sexp_build (&result, NULL, "(value %b)", (int)unpadlen, unpad);
++      rc_sexp = sexp_build (&result, NULL, "(value %b)", (int)unpadlen, unpad);
+       *r_plain = sexp_null_cond (result, !!rc);
+       dummy = sexp_null_cond (result, !rc);
+       sexp_release (dummy);
++      if (!rc && rc_sexp)
++        rc = rc_sexp;
+       break;
+ 
+     case PUBKEY_ENC_OAEP:
+@@ -1527,10 +1529,12 @@ rsa_decrypt (gcry_sexp_t *r_plain, gcry_sexp_t s_data, gcry_sexp_t keyparms)
+                                   plain, ctx.label, ctx.labellen);
+       mpi_free (plain);
+       plain = NULL;
+-      sexp_build (&result, NULL, "(value %b)", (int)unpadlen, unpad);
++      rc_sexp = sexp_build (&result, NULL, "(value %b)", (int)unpadlen, unpad);
+       *r_plain = sexp_null_cond (result, !!rc);
+       dummy = sexp_null_cond (result,!rc);
+       sexp_release (dummy);
++      if (!rc && rc_sexp)
++        rc = rc_sexp;
+       break;
+ 
+     default:
+-- 
+2.44.0
+
+From 1e9ddbd65c4627235611d75c3198c4ec197c9a05 Mon Sep 17 00:00:00 2001
+From: Jussi Kivilinna <jussi.kivilinna@iki.fi>
+Date: Mon, 30 Oct 2023 21:05:24 +0200
+Subject: [PATCH] Use single constant-time memory comparison implementation
+
+* src/const-time.c (ct_not_memequal): Use original 'buf_eq_const'
+implementation here.
+(ct_memequal): New.
+* cipher/bufhelp.h (buf_eq_const): Call to 'ct_memequal'.
+--
+
+Signed-off-by: Jussi Kivilinna <jussi.kivilinna@iki.fi>
+---
+ cipher/bufhelp.h | 19 +++----------------
+ src/const-time.c | 36 +++++++++++++++++++++++-------------
+ src/const-time.h | 13 +++++++++++++
+ 3 files changed, 39 insertions(+), 29 deletions(-)
+
+diff --git a/cipher/bufhelp.h b/cipher/bufhelp.h
+index fa5b2e8e..6dcc622a 100644
+--- a/cipher/bufhelp.h
++++ b/cipher/bufhelp.h
+@@ -22,6 +22,7 @@
+ 
+ #include "g10lib.h"
+ #include "bithelp.h"
++#include "const-time.h"
+ 
+ 
+ #undef BUFHELP_UNALIGNED_ACCESS
+@@ -362,23 +363,9 @@ buf_xor_n_copy(void *_dst_xor, void *_srcdst_cpy, const void *_src, size_t len)
+ /* Constant-time compare of two buffers.  Returns 1 if buffers are equal,
+    and 0 if buffers differ.  */
+ static inline int
+-buf_eq_const(const void *_a, const void *_b, size_t len)
++buf_eq_const(const void *a, const void *b, size_t len)
+ {
+-  const byte *a = _a;
+-  const byte *b = _b;
+-  int ab, ba;
+-  size_t i;
+-
+-  /* Constant-time compare. */
+-  for (i = 0, ab = 0, ba = 0; i < len; i++)
+-    {
+-      /* If a[i] != b[i], either ab or ba will be negative. */
+-      ab |= a[i] - b[i];
+-      ba |= b[i] - a[i];
+-    }
+-
+-  /* 'ab | ba' is negative when buffers are not equal. */
+-  return (ab | ba) >= 0;
++  return ct_memequal (a, b, len);
+ }
+ 
+ 
+diff --git a/src/const-time.c b/src/const-time.c
+index 400af993..fb787a02 100644
+--- a/src/const-time.c
++++ b/src/const-time.c
+@@ -26,25 +26,35 @@
+ /*
+  * Compare byte arrays of length LEN, return 1 if it's not same,
+  * 0, otherwise.
+- *
+- * Originally in NetBSD as "consttime_memequal" which is:
+- *
+- *   Written by Matthias Drochner <drochner@NetBSD.org>.
+- *   Public domain.
+- *
+- * Modified the function name, return type to unsigned,
+- * and return value (0 <-> 1).
+  */
+ unsigned int
+ ct_not_memequal (const void *b1, const void *b2, size_t len)
+ {
+-  const unsigned char *c1 = b1, *c2 = b2;
+-  unsigned int res = 0;
++  const byte *a = b1;
++  const byte *b = b2;
++  int ab, ba;
++  size_t i;
++
++  /* Constant-time compare. */
++  for (i = 0, ab = 0, ba = 0; i < len; i++)
++    {
++      /* If a[i] != b[i], either ab or ba will be negative. */
++      ab |= a[i] - b[i];
++      ba |= b[i] - a[i];
++    }
+ 
+-  while (len--)
+-    res |= *c1++ ^ *c2++;
++  /* 'ab | ba' is negative when buffers are not equal, extract sign bit.  */
++  return ((unsigned int)(ab | ba) >> (sizeof(unsigned int) * 8 - 1)) & 1;
++}
+ 
+-  return ct_not_equal_byte (res, 0);
++/*
++ * Compare byte arrays of length LEN, return 0 if it's not same,
++ * 1, otherwise.
++ */
++unsigned int
++ct_memequal (const void *b1, const void *b2, size_t len)
++{
++  return ct_not_memequal (b1, b2, len) ^ 1;
+ }
+ 
+ /*
+diff --git a/src/const-time.h b/src/const-time.h
+index 53d7dd2a..defe5ff4 100644
+--- a/src/const-time.h
++++ b/src/const-time.h
+@@ -17,6 +17,12 @@
+  * License along with this program; if not, see <https://www.gnu.org/licenses/>.
+  */
+ 
++#ifndef GCRY_CONST_TIME_H
++#define GCRY_CONST_TIME_H
++
++#include "types.h"
++
++
+ /*
+  * Return 1 if it's not same, 0 if same.
+  */
+@@ -40,6 +46,11 @@ ct_not_equal_byte (unsigned char b0, unsigned char b1)
+    any structure.  */
+ unsigned int ct_not_memequal (const void *b1, const void *b2, size_t len);
+ 
++/* Compare byte-arrays of length LEN, return 0 if it's not same, 1
++   otherwise.  We use pointer of void *, so that it can be used with
++   any structure.  */
++unsigned int ct_memequal (const void *b1, const void *b2, size_t len);
++
+ /*
+  *  Return NULL when OP_ENABLED=1
+  *  otherwise, return W
+@@ -60,3 +71,5 @@ sexp_null_cond (gcry_sexp_t w, unsigned long op_enable)
+  */
+ void ct_memmov_cond (void *dst, const void *src, size_t len,
+                      unsigned long op_enable);
++
++#endif /*GCRY_CONST_TIME_H*/
+-- 
+2.44.0
+
+From 137e35ad47ee8734d0f3ffb6af1d1669c4621e0b Mon Sep 17 00:00:00 2001
+From: Jussi Kivilinna <jussi.kivilinna@iki.fi>
+Date: Mon, 30 Oct 2023 20:17:09 +0200
+Subject: [PATCH] const-time: always avoid comparison operator for byte
+ comparison
+
+* configure.ac: Remove POSSIBLE_CONDITIONAL_BRANCH_IN_BYTE_COMPARISON
+macro.
+* src/const-time.h (ct_not_equal_byte): Remove
+POSSIBLE_CONDITIONAL_BRANCH_IN_BYTE_COMPARISON ifdef.
+--
+
+Performance impact of avoiding comparison is negligible, so
+remove the option for using comparison to make this easier
+maintain (tested on every arch).
+
+Signed-off-by: Jussi Kivilinna <jussi.kivilinna@iki.fi>
+---
+ configure.ac     | 5 -----
+ src/const-time.h | 4 ----
+ 2 files changed, 9 deletions(-)
+
+diff --git a/configure.ac b/configure.ac
+index aead8347..4f7c3a52 100644
+--- a/configure.ac
++++ b/configure.ac
+@@ -121,11 +121,6 @@ AH_BOTTOM([
+    properly prefixed.  */
+ #define CAMELLIA_EXT_SYM_PREFIX _gcry_
+ 
+-/* For some architectures or a specific compiler vendor, we need
+-   to care about possible conditional branch in byte comparison.  */
+-#if defined(__vax__) || defined(AVR) || defined(_MSC_VER)
+-# define POSSIBLE_CONDITIONAL_BRANCH_IN_BYTE_COMPARISON 1
+-#endif
+ #endif /*_GCRYPT_CONFIG_H_INCLUDED*/
+ ])
+ 
+diff --git a/src/const-time.h b/src/const-time.h
+index defe5ff4..4f14f86b 100644
+--- a/src/const-time.h
++++ b/src/const-time.h
+@@ -29,16 +29,12 @@
+ static inline unsigned int
+ ct_not_equal_byte (unsigned char b0, unsigned char b1)
+ {
+-#ifdef POSSIBLE_CONDITIONAL_BRANCH_IN_BYTE_COMPARISON
+   unsigned int diff;
+ 
+   diff = b0;
+   diff ^= b1;
+ 
+   return (0U - diff) >> (sizeof (unsigned int)*8 - 1);
+-#else
+-  return b0 != b1;
+-#endif
+ }
+ 
+ /* Compare byte-arrays of length LEN, return 1 if it's not same, 0
+-- 
+2.44.0
+
+From 84f934c09afac18b3f4351646c0fe6f93aede277 Mon Sep 17 00:00:00 2001
+From: Jussi Kivilinna <jussi.kivilinna@iki.fi>
+Date: Mon, 30 Oct 2023 20:15:05 +0200
+Subject: [PATCH] rsa, elgamal: avoid logical not operator in constant-time
+ code
+
+* cipher/elgamal.c (elg_decrypt): Replace ! operator with calls to
+ct_is_not_zero/ct_is_zero/ct_ulong_select.
+* cipher/rsa-common.c (_gcry_rsa_pkcs1_decode_for_enc): Replace !
+operator with call to ct_is_zero.
+* cipher/rsa.c (rsa_decrypt): Replace ! operator with calls to
+ct_is_not_zero/ct_is_zero/ct_ulong_select.
+* src/const-time.c (_gcry_ct_vzero, _gcry_ct_vone): New.
+* src/const-time.h (_gcry_ct_vzero, _gcry_ct_vone): New.
+(ct_is_not_zero, ct_is_zero, DEFINE_CT_TYPE_SELECT_FUNC)
+(ct_uintptr_select, ct_ulong_select): New.
+(sexp_null_cond): Use ct_uintptr_select.
+--
+
+Signed-off-by: Jussi Kivilinna <jussi.kivilinna@iki.fi>
+---
+ cipher/elgamal.c    | 22 +++++++++++---------
+ cipher/rsa-common.c |  2 +-
+ cipher/rsa.c        | 16 +++++++--------
+ src/const-time.c    |  8 ++++++++
+ src/const-time.h    | 49 +++++++++++++++++++++++++++++++++++++++++----
+ 5 files changed, 74 insertions(+), 23 deletions(-)
+
+diff --git a/cipher/elgamal.c b/cipher/elgamal.c
+index 06881cb6..540ecb02 100644
+--- a/cipher/elgamal.c
++++ b/cipher/elgamal.c
+@@ -931,26 +931,28 @@ elg_decrypt (gcry_sexp_t *r_plain, gcry_sexp_t s_data, gcry_sexp_t keyparms)
+     {
+     case PUBKEY_ENC_PKCS1:
+       rc = _gcry_rsa_pkcs1_decode_for_enc (&unpad, &unpadlen, ctx.nbits, plain);
+-      mpi_free (plain); plain = NULL;
++      mpi_free (plain);
++      plain = NULL;
+       rc_sexp = sexp_build (&result, NULL, "(value %b)", (int)unpadlen, unpad);
+-      *r_plain = sexp_null_cond (result, !!rc);
+-      dummy = sexp_null_cond (result, !rc);
++      *r_plain = sexp_null_cond (result, ct_is_not_zero (rc));
++      dummy = sexp_null_cond (result, ct_is_zero (rc));
+       sexp_release (dummy);
+-      if (!rc && rc_sexp)
+-        rc = rc_sexp;
++      rc = ct_ulong_select (rc_sexp, rc,
++			    ct_is_zero (rc) & ct_is_not_zero (rc_sexp));
+       break;
+ 
+     case PUBKEY_ENC_OAEP:
+       rc = _gcry_rsa_oaep_decode (&unpad, &unpadlen,
+                                   ctx.nbits, ctx.hash_algo, plain,
+                                   ctx.label, ctx.labellen);
+-      mpi_free (plain); plain = NULL;
++      mpi_free (plain);
++      plain = NULL;
+       rc_sexp = sexp_build (&result, NULL, "(value %b)", (int)unpadlen, unpad);
+-      *r_plain = sexp_null_cond (result, !!rc);
+-      dummy = sexp_null_cond (result, !rc);
++      *r_plain = sexp_null_cond (result, ct_is_not_zero (rc));
++      dummy = sexp_null_cond (result, ct_is_zero (rc));
+       sexp_release (dummy);
+-      if (!rc && rc_sexp)
+-        rc = rc_sexp;
++      rc = ct_ulong_select (rc_sexp, rc,
++			    ct_is_zero (rc) & ct_is_not_zero (rc_sexp));
+       break;
+ 
+     default:
+diff --git a/cipher/rsa-common.c b/cipher/rsa-common.c
+index 74eb6341..1920eedd 100644
+--- a/cipher/rsa-common.c
++++ b/cipher/rsa-common.c
+@@ -246,7 +246,7 @@ _gcry_rsa_pkcs1_decode_for_enc (unsigned char **r_result, size_t *r_resultlen,
+     }
+ 
+   failed |= not_found;
+-  n0 += !not_found; /* Skip the zero byte.  */
++  n0 += ct_is_zero (not_found); /* Skip the zero byte.  */
+ 
+   /* To avoid an extra allocation we reuse the frame buffer.  The only
+      caller of this function will anyway free the result soon.  */
+diff --git a/cipher/rsa.c b/cipher/rsa.c
+index 383e2474..c7a809f4 100644
+--- a/cipher/rsa.c
++++ b/cipher/rsa.c
+@@ -1516,11 +1516,11 @@ rsa_decrypt (gcry_sexp_t *r_plain, gcry_sexp_t s_data, gcry_sexp_t keyparms)
+       mpi_free (plain);
+       plain = NULL;
+       rc_sexp = sexp_build (&result, NULL, "(value %b)", (int)unpadlen, unpad);
+-      *r_plain = sexp_null_cond (result, !!rc);
+-      dummy = sexp_null_cond (result, !rc);
++      *r_plain = sexp_null_cond (result, ct_is_not_zero (rc));
++      dummy = sexp_null_cond (result, ct_is_zero (rc));
+       sexp_release (dummy);
+-      if (!rc && rc_sexp)
+-        rc = rc_sexp;
++      rc = ct_ulong_select (rc_sexp, rc,
++			    ct_is_zero (rc) & ct_is_not_zero (rc_sexp));
+       break;
+ 
+     case PUBKEY_ENC_OAEP:
+@@ -1530,11 +1530,11 @@ rsa_decrypt (gcry_sexp_t *r_plain, gcry_sexp_t s_data, gcry_sexp_t keyparms)
+       mpi_free (plain);
+       plain = NULL;
+       rc_sexp = sexp_build (&result, NULL, "(value %b)", (int)unpadlen, unpad);
+-      *r_plain = sexp_null_cond (result, !!rc);
+-      dummy = sexp_null_cond (result,!rc);
++      *r_plain = sexp_null_cond (result, ct_is_not_zero (rc));
++      dummy = sexp_null_cond (result, ct_is_zero (rc));
+       sexp_release (dummy);
+-      if (!rc && rc_sexp)
+-        rc = rc_sexp;
++      rc = ct_ulong_select (rc_sexp, rc,
++			    ct_is_zero (rc) & ct_is_not_zero (rc_sexp));
+       break;
+ 
+     default:
+diff --git a/src/const-time.c b/src/const-time.c
+index fb787a02..908c0ee9 100644
+--- a/src/const-time.c
++++ b/src/const-time.c
+@@ -23,6 +23,14 @@
+ #include "g10lib.h"
+ #include "const-time.h"
+ 
++
++/* These variables are used to generate masks from conditional operation
++ * flag parameters.  Use of volatile prevents compiler optimizations from
++ * converting AND-masking to conditional branches.  */
++volatile unsigned int _gcry_ct_vzero = 0;
++volatile unsigned int _gcry_ct_vone = 1;
++
++
+ /*
+  * Compare byte arrays of length LEN, return 1 if it's not same,
+  * 0, otherwise.
+diff --git a/src/const-time.h b/src/const-time.h
+index 4f14f86b..3a229ddb 100644
+--- a/src/const-time.h
++++ b/src/const-time.h
+@@ -23,6 +23,34 @@
+ #include "types.h"
+ 
+ 
++extern volatile unsigned int _gcry_ct_vzero;
++extern volatile unsigned int _gcry_ct_vone;
++
++
++/*
++ * Return 0 if A is 0 and return 1 otherwise.
++ */
++static inline unsigned int
++ct_is_not_zero (unsigned int a)
++{
++  /* Sign bit set if A != 0. */
++  a = a | (-a);
++
++  return a >> (sizeof(unsigned int) * 8 - 1);
++}
++
++/*
++ * Return 1 if A is 0 and return 0 otherwise.
++ */
++static inline unsigned int
++ct_is_zero (unsigned int a)
++{
++  /* Sign bit set if A == 0. */
++  a = ~a & ~(-a);
++
++  return a >> (sizeof(unsigned int) * 8 - 1);
++}
++
+ /*
+  * Return 1 if it's not same, 0 if same.
+  */
+@@ -47,6 +75,21 @@ unsigned int ct_not_memequal (const void *b1, const void *b2, size_t len);
+    any structure.  */
+ unsigned int ct_memequal (const void *b1, const void *b2, size_t len);
+ 
++/*
++ *  Return A when OP_ENABLED=1
++ *  otherwise, return B
++ */
++#define DEFINE_CT_TYPE_SELECT_FUNC(name, type) \
++  static inline type \
++  ct_##name##_select (type a, type b, unsigned long op_enable) \
++  { \
++    type mask_b = (type)op_enable - (type)_gcry_ct_vone; \
++    type mask_a = (type)_gcry_ct_vzero - (type)op_enable; \
++    return (mask_a & a) | (mask_b & b); \
++  }
++DEFINE_CT_TYPE_SELECT_FUNC(uintptr, uintptr_t)
++DEFINE_CT_TYPE_SELECT_FUNC(ulong, unsigned long)
++
+ /*
+  *  Return NULL when OP_ENABLED=1
+  *  otherwise, return W
+@@ -54,10 +97,8 @@ unsigned int ct_memequal (const void *b1, const void *b2, size_t len);
+ static inline gcry_sexp_t
+ sexp_null_cond (gcry_sexp_t w, unsigned long op_enable)
+ {
+-  static volatile uintptr_t vone = 1;
+-  size_t mask = (uintptr_t)op_enable - vone;
+-
+-  return (gcry_sexp_t)(void *)((uintptr_t)w & mask);
++  uintptr_t o = ct_uintptr_select((uintptr_t)NULL, (uintptr_t)w, op_enable);
++  return (gcry_sexp_t)(void *)o;
+ }
+ 
+ /*
+-- 
+2.44.0
+
+From 0c6ec6bbe788b8c4a6982b2128d442b51323c898 Mon Sep 17 00:00:00 2001
+From: Jussi Kivilinna <jussi.kivilinna@iki.fi>
+Date: Wed, 1 Nov 2023 21:08:49 +0200
+Subject: [PATCH] mpih_set_cond: restore EM leakage mitigation
+
+* mpi/mpih-const-time.c (_gcry_mpih_set_cond): Replace single mask + XOR
+with dual mask + AND/OR; Add comment about reason for dual mask usage.
+(_gcry_mpih_add_n_cond, _gcry_mpih_sub_n_cond, _gcry_mpih_swap_cond)
+(_gcry_mpih_abs_cond): Add comment about reason for dual mask usage.
+--
+
+Signed-off-by: Jussi Kivilinna <jussi.kivilinna@iki.fi>
+---
+ mpi/mpih-const-time.c | 24 ++++++++++++++++--------
+ 1 file changed, 16 insertions(+), 8 deletions(-)
+
+diff --git a/mpi/mpih-const-time.c b/mpi/mpih-const-time.c
+index 3f0440a9..388d2a91 100644
+--- a/mpi/mpih-const-time.c
++++ b/mpi/mpih-const-time.c
+@@ -39,11 +39,15 @@ void
+ _gcry_mpih_set_cond (mpi_ptr_t wp, mpi_ptr_t up, mpi_size_t usize,
+                      unsigned long op_enable)
+ {
++  /* Note: dual mask with AND/OR used for EM leakage mitigation */
++  mpi_limb_t mask1 = vzero - op_enable;
++  mpi_limb_t mask2 = op_enable - vone;
+   mpi_size_t i;
+-  mpi_limb_t mask = vzero - op_enable;
+ 
+   for (i = 0; i < usize; i++)
+-    wp[i] ^= mask & (wp[i] ^ up[i]);
++    {
++      wp[i] = (wp[i] & mask2) | (up[i] & mask1);
++    }
+ }
+ 
+ 
+@@ -55,10 +59,11 @@ mpi_limb_t
+ _gcry_mpih_add_n_cond (mpi_ptr_t wp, mpi_ptr_t up, mpi_ptr_t vp,
+                        mpi_size_t usize, unsigned long op_enable)
+ {
+-  mpi_size_t i;
+-  mpi_limb_t cy;
++  /* Note: dual mask with AND/OR used for EM leakage mitigation */
+   mpi_limb_t mask1 = vzero - op_enable;
+   mpi_limb_t mask2 = op_enable - vone;
++  mpi_size_t i;
++  mpi_limb_t cy;
+ 
+   cy = 0;
+   for (i = 0; i < usize; i++)
+@@ -86,10 +91,11 @@ mpi_limb_t
+ _gcry_mpih_sub_n_cond (mpi_ptr_t wp, mpi_ptr_t up, mpi_ptr_t vp,
+                        mpi_size_t usize, unsigned long op_enable)
+ {
+-  mpi_size_t i;
+-  mpi_limb_t cy;
++  /* Note: dual mask with AND/OR used for EM leakage mitigation */
+   mpi_limb_t mask1 = vzero - op_enable;
+   mpi_limb_t mask2 = op_enable - vone;
++  mpi_size_t i;
++  mpi_limb_t cy;
+ 
+   cy = 0;
+   for (i = 0; i < usize; i++)
+@@ -117,9 +123,10 @@ void
+ _gcry_mpih_swap_cond (mpi_ptr_t up, mpi_ptr_t vp, mpi_size_t usize,
+                       unsigned long op_enable)
+ {
+-  mpi_size_t i;
++  /* Note: dual mask with AND/OR used for EM leakage mitigation */
+   mpi_limb_t mask1 = vzero - op_enable;
+   mpi_limb_t mask2 = op_enable - vone;
++  mpi_size_t i;
+ 
+   for (i = 0; i < usize; i++)
+     {
+@@ -139,10 +146,11 @@ void
+ _gcry_mpih_abs_cond (mpi_ptr_t wp, mpi_ptr_t up, mpi_size_t usize,
+                      unsigned long op_enable)
+ {
+-  mpi_size_t i;
++  /* Note: dual mask with AND/OR used for EM leakage mitigation */
+   mpi_limb_t mask1 = vzero - op_enable;
+   mpi_limb_t mask2 = op_enable - vone;
+   mpi_limb_t cy = op_enable;
++  mpi_size_t i;
+ 
+   for (i = 0; i < usize; i++)
+     {
+-- 
+2.44.0
+
+From 22dde5150ee2be01651410ed9756601ba6a29c93 Mon Sep 17 00:00:00 2001
+From: Jussi Kivilinna <jussi.kivilinna@iki.fi>
+Date: Wed, 1 Nov 2023 21:31:02 +0200
+Subject: [PATCH] const-time: prefix global symbols with _gcry_
+
+* cipher/const-time.c (ct_not_memequal, ct_memequal)
+(ct_memmov_cond): Rename these to ...
+(_gcry_ct_not_memequal, _gcry_ct_memequal)
+(_gcry_ct_memmov_cond): ... these.
+* cipher/const-time.h (ct_not_memequal, ct_memequal)
+(ct_memmov_cond): Rename these to ...
+(_gcry_ct_not_memequal, _gcry_ct_memequal)
+(_gcry_ct_memmov_cond): ... these.
+(ct_not_memequal, ct_memequal, ct_memmov_cond): New macros.
+--
+
+Signed-off-by: Jussi Kivilinna <jussi.kivilinna@iki.fi>
+---
+ src/const-time.c | 10 +++++-----
+ src/const-time.h | 13 +++++++++----
+ 2 files changed, 14 insertions(+), 9 deletions(-)
+
+diff --git a/src/const-time.c b/src/const-time.c
+index 908c0ee9..2066d48d 100644
+--- a/src/const-time.c
++++ b/src/const-time.c
+@@ -36,7 +36,7 @@ volatile unsigned int _gcry_ct_vone = 1;
+  * 0, otherwise.
+  */
+ unsigned int
+-ct_not_memequal (const void *b1, const void *b2, size_t len)
++_gcry_ct_not_memequal (const void *b1, const void *b2, size_t len)
+ {
+   const byte *a = b1;
+   const byte *b = b2;
+@@ -60,9 +60,9 @@ ct_not_memequal (const void *b1, const void *b2, size_t len)
+  * 1, otherwise.
+  */
+ unsigned int
+-ct_memequal (const void *b1, const void *b2, size_t len)
++_gcry_ct_memequal (const void *b1, const void *b2, size_t len)
+ {
+-  return ct_not_memequal (b1, b2, len) ^ 1;
++  return _gcry_ct_not_memequal (b1, b2, len) ^ 1;
+ }
+ 
+ /*
+@@ -71,8 +71,8 @@ ct_memequal (const void *b1, const void *b2, size_t len)
+  * DST > SRC, the memory areas must not overlap.
+  */
+ void
+-ct_memmov_cond (void *dst, const void *src, size_t len,
+-                unsigned long op_enable)
++_gcry_ct_memmov_cond (void *dst, const void *src, size_t len,
++		      unsigned long op_enable)
+ {
+   size_t i;
+   unsigned char mask;
+diff --git a/src/const-time.h b/src/const-time.h
+index 3a229ddb..e324dcb7 100644
+--- a/src/const-time.h
++++ b/src/const-time.h
+@@ -23,6 +23,11 @@
+ #include "types.h"
+ 
+ 
++#define ct_not_memequal _gcry_ct_not_memequal
++#define ct_memequal _gcry_ct_memequal
++#define ct_memmov_cond _gcry_ct_memmov_cond
++
++
+ extern volatile unsigned int _gcry_ct_vzero;
+ extern volatile unsigned int _gcry_ct_vone;
+ 
+@@ -68,12 +73,12 @@ ct_not_equal_byte (unsigned char b0, unsigned char b1)
+ /* Compare byte-arrays of length LEN, return 1 if it's not same, 0
+    otherwise.  We use pointer of void *, so that it can be used with
+    any structure.  */
+-unsigned int ct_not_memequal (const void *b1, const void *b2, size_t len);
++unsigned int _gcry_ct_not_memequal (const void *b1, const void *b2, size_t len);
+ 
+ /* Compare byte-arrays of length LEN, return 0 if it's not same, 1
+    otherwise.  We use pointer of void *, so that it can be used with
+    any structure.  */
+-unsigned int ct_memequal (const void *b1, const void *b2, size_t len);
++unsigned int _gcry_ct_memequal (const void *b1, const void *b2, size_t len);
+ 
+ /*
+  *  Return A when OP_ENABLED=1
+@@ -106,7 +111,7 @@ sexp_null_cond (gcry_sexp_t w, unsigned long op_enable)
+  * OP_ENABLED=1.  When DST <= SRC, the memory areas may overlap.  When
+  * DST > SRC, the memory areas must not overlap.
+  */
+-void ct_memmov_cond (void *dst, const void *src, size_t len,
+-                     unsigned long op_enable);
++void _gcry_ct_memmov_cond (void *dst, const void *src, size_t len,
++			   unsigned long op_enable);
+ 
+ #endif /*GCRY_CONST_TIME_H*/
+-- 
+2.44.0
+
+From 4d3e0e30b98b2acb90acb2792b8327c26824a66f Mon Sep 17 00:00:00 2001
+From: Jussi Kivilinna <jussi.kivilinna@iki.fi>
+Date: Wed, 1 Nov 2023 21:34:58 +0200
+Subject: [PATCH] const-time: ct_memmov_cond: switch to use dual mask approach
+
+* src/const-time.c (_gcry_ct_memmov_cond): Use dual mask + AND/OR
+instead of single mask + XOR.
+--
+
+Signed-off-by: Jussi Kivilinna <jussi.kivilinna@iki.fi>
+---
+ src/const-time.c | 9 +++++----
+ 1 file changed, 5 insertions(+), 4 deletions(-)
+
+diff --git a/src/const-time.c b/src/const-time.c
+index 2066d48d..73bf8b40 100644
+--- a/src/const-time.c
++++ b/src/const-time.c
+@@ -74,12 +74,13 @@ void
+ _gcry_ct_memmov_cond (void *dst, const void *src, size_t len,
+ 		      unsigned long op_enable)
+ {
+-  size_t i;
+-  unsigned char mask;
++  /* Note: dual mask with AND/OR used for EM leakage mitigation */
++  unsigned char mask1 = _gcry_ct_vzero - op_enable;
++  unsigned char mask2 = op_enable - _gcry_ct_vone;
+   unsigned char *b_dst = dst;
+   const unsigned char *b_src = src;
++  size_t i;
+ 
+-  mask = -(unsigned char)op_enable;
+   for (i = 0; i < len; i++)
+-    b_dst[i] ^= mask & (b_dst[i] ^ b_src[i]);
++    b_dst[i] = (b_dst[i] & mask2) | (b_src[i] & mask1);
+ }
+-- 
+2.44.0
+
+From 179df341162c74da312f76363a0ff1f2f303aa78 Mon Sep 17 00:00:00 2001
+From: Jussi Kivilinna <jussi.kivilinna@iki.fi>
+Date: Wed, 1 Nov 2023 21:43:36 +0200
+Subject: [PATCH] mpih-const-time: use global vzero/vone variable
+
+* mpi/mpih-const-time.c (vzero, vone): Remove.
+(_gcry_mpih_set_cond, _gcry_mpih_add_n_cond, _gcry_mpih_sub_n_cond)
+(_gcry_mpih_swap_cond, _gcry_mpih_abs_cond): Use _gcry_ct_vzero and
+_gcry_ct_vone.
+--
+
+Signed-off-by: Jussi Kivilinna <jussi.kivilinna@iki.fi>
+---
+ mpi/mpih-const-time.c | 26 +++++++++++---------------
+ 1 file changed, 11 insertions(+), 15 deletions(-)
+
+diff --git a/mpi/mpih-const-time.c b/mpi/mpih-const-time.c
+index 388d2a91..85dba389 100644
+--- a/mpi/mpih-const-time.c
++++ b/mpi/mpih-const-time.c
+@@ -22,14 +22,10 @@
+ #include <stdlib.h>
+ #include "mpi-internal.h"
+ #include "g10lib.h"
++#include "const-time.h"
+ 
+ #define A_LIMB_1 ((mpi_limb_t)1)
+ 
+-/* These variables are used to generate masks from conditional operation
+- * flag parameters.  Use of volatile prevents compiler optimizations from
+- * converting AND-masking to conditional branches.  */
+-static volatile mpi_limb_t vzero = 0;
+-static volatile mpi_limb_t vone = 1;
+ 
+ /*
+  *  W = U when OP_ENABLED=1
+@@ -40,8 +36,8 @@ _gcry_mpih_set_cond (mpi_ptr_t wp, mpi_ptr_t up, mpi_size_t usize,
+                      unsigned long op_enable)
+ {
+   /* Note: dual mask with AND/OR used for EM leakage mitigation */
+-  mpi_limb_t mask1 = vzero - op_enable;
+-  mpi_limb_t mask2 = op_enable - vone;
++  mpi_limb_t mask1 = _gcry_ct_vzero - op_enable;
++  mpi_limb_t mask2 = op_enable - _gcry_ct_vone;
+   mpi_size_t i;
+ 
+   for (i = 0; i < usize; i++)
+@@ -60,8 +56,8 @@ _gcry_mpih_add_n_cond (mpi_ptr_t wp, mpi_ptr_t up, mpi_ptr_t vp,
+                        mpi_size_t usize, unsigned long op_enable)
+ {
+   /* Note: dual mask with AND/OR used for EM leakage mitigation */
+-  mpi_limb_t mask1 = vzero - op_enable;
+-  mpi_limb_t mask2 = op_enable - vone;
++  mpi_limb_t mask1 = _gcry_ct_vzero - op_enable;
++  mpi_limb_t mask2 = op_enable - _gcry_ct_vone;
+   mpi_size_t i;
+   mpi_limb_t cy;
+ 
+@@ -92,8 +88,8 @@ _gcry_mpih_sub_n_cond (mpi_ptr_t wp, mpi_ptr_t up, mpi_ptr_t vp,
+                        mpi_size_t usize, unsigned long op_enable)
+ {
+   /* Note: dual mask with AND/OR used for EM leakage mitigation */
+-  mpi_limb_t mask1 = vzero - op_enable;
+-  mpi_limb_t mask2 = op_enable - vone;
++  mpi_limb_t mask1 = _gcry_ct_vzero - op_enable;
++  mpi_limb_t mask2 = op_enable - _gcry_ct_vone;
+   mpi_size_t i;
+   mpi_limb_t cy;
+ 
+@@ -124,8 +120,8 @@ _gcry_mpih_swap_cond (mpi_ptr_t up, mpi_ptr_t vp, mpi_size_t usize,
+                       unsigned long op_enable)
+ {
+   /* Note: dual mask with AND/OR used for EM leakage mitigation */
+-  mpi_limb_t mask1 = vzero - op_enable;
+-  mpi_limb_t mask2 = op_enable - vone;
++  mpi_limb_t mask1 = _gcry_ct_vzero - op_enable;
++  mpi_limb_t mask2 = op_enable - _gcry_ct_vone;
+   mpi_size_t i;
+ 
+   for (i = 0; i < usize; i++)
+@@ -147,8 +143,8 @@ _gcry_mpih_abs_cond (mpi_ptr_t wp, mpi_ptr_t up, mpi_size_t usize,
+                      unsigned long op_enable)
+ {
+   /* Note: dual mask with AND/OR used for EM leakage mitigation */
+-  mpi_limb_t mask1 = vzero - op_enable;
+-  mpi_limb_t mask2 = op_enable - vone;
++  mpi_limb_t mask1 = _gcry_ct_vzero - op_enable;
++  mpi_limb_t mask2 = op_enable - _gcry_ct_vone;
+   mpi_limb_t cy = op_enable;
+   mpi_size_t i;
+ 
+-- 
+2.44.0
+
+From d4aee9ace9a904446b987dddc2999119c4d62dae Mon Sep 17 00:00:00 2001
+From: Jussi Kivilinna <jussi.kivilinna@iki.fi>
+Date: Wed, 1 Nov 2023 22:11:35 +0200
+Subject: [PATCH] mpiutil: use global vone and vzero
+
+* mpi/mpiutil.c (_gcry_mpi_set_cond, _gcry_mpi_swap_cond): Use
+_gcry_ct_vzero and _gcry_ct_vone.
+--
+
+Signed-off-by: Jussi Kivilinna <jussi.kivilinna@iki.fi>
+---
+ mpi/mpiutil.c | 17 +++++++----------
+ 1 file changed, 7 insertions(+), 10 deletions(-)
+
+diff --git a/mpi/mpiutil.c b/mpi/mpiutil.c
+index d5a1b8a8..f7506718 100644
+--- a/mpi/mpiutil.c
++++ b/mpi/mpiutil.c
+@@ -27,6 +27,7 @@
+ #include "g10lib.h"
+ #include "mpi-internal.h"
+ #include "mod-source-info.h"
++#include "const-time.h"
+ 
+ 
+ #if SIZEOF_UNSIGNED_INT == 2
+@@ -46,12 +47,6 @@
+ /* Constants allocated right away at startup.  */
+ static gcry_mpi_t constants[MPI_NUMBER_OF_CONSTANTS];
+ 
+-/* These variables are used to generate masks from conditional operation
+- * flag parameters.  Use of volatile prevents compiler optimizations from
+- * converting AND-masking to conditional branches.  */
+-static volatile mpi_limb_t vzero = 0;
+-static volatile mpi_limb_t vone = 1;
+-
+ 
+ const char *
+ _gcry_mpi_get_hw_config (void)
+@@ -513,10 +508,11 @@ _gcry_mpi_set (gcry_mpi_t w, gcry_mpi_t u)
+ gcry_mpi_t
+ _gcry_mpi_set_cond (gcry_mpi_t w, const gcry_mpi_t u, unsigned long set)
+ {
++  /* Note: dual mask with AND/OR used for EM leakage mitigation */
++  mpi_limb_t mask1 = _gcry_ct_vzero - set;
++  mpi_limb_t mask2 = set - _gcry_ct_vone;
+   mpi_size_t i;
+   mpi_size_t nlimbs = u->alloced;
+-  mpi_limb_t mask1 = vzero - set;
+-  mpi_limb_t mask2 = set - vone;
+   mpi_limb_t xu;
+   mpi_limb_t xw;
+   mpi_limb_t *uu = u->d;
+@@ -614,10 +610,11 @@ _gcry_mpi_swap (gcry_mpi_t a, gcry_mpi_t b)
+ void
+ _gcry_mpi_swap_cond (gcry_mpi_t a, gcry_mpi_t b, unsigned long swap)
+ {
++  /* Note: dual mask with AND/OR used for EM leakage mitigation */
++  mpi_limb_t mask1 = _gcry_ct_vzero - swap;
++  mpi_limb_t mask2 = swap - _gcry_ct_vone;
+   mpi_size_t i;
+   mpi_size_t nlimbs;
+-  mpi_limb_t mask1 = vzero - swap;
+-  mpi_limb_t mask2 = swap - vone;
+   mpi_limb_t *ua = a->d;
+   mpi_limb_t *ub = b->d;
+   mpi_limb_t xa;
+-- 
+2.44.0
+
+From aab6a42d5f44724b73a02598546a5e7d8b33298e Mon Sep 17 00:00:00 2001
+From: Jussi Kivilinna <jussi.kivilinna@iki.fi>
+Date: Wed, 1 Nov 2023 21:45:05 +0200
+Subject: [PATCH] mpih_cmp_ui: avoid unintentional conditional branch
+
+* mpi/mpi-internal.h (mpih_limb_is_zero): New.
+* mpi/mpih-const-time.c (_gcry_mpih_cmp_ui): Use mpih_limb_is_zero
+instead of comparison.
+--
+
+Signed-off-by: Jussi Kivilinna <jussi.kivilinna@iki.fi>
+---
+ mpi/mpi-internal.h    | 9 +++++++++
+ mpi/mpih-const-time.c | 2 +-
+ 2 files changed, 10 insertions(+), 1 deletion(-)
+
+diff --git a/mpi/mpi-internal.h b/mpi/mpi-internal.h
+index 79a6cce7..bb12e86c 100644
+--- a/mpi/mpi-internal.h
++++ b/mpi/mpi-internal.h
+@@ -267,6 +267,15 @@ mpi_limb_t _gcry_mpih_rshift( mpi_ptr_t wp, mpi_ptr_t up, mpi_size_t usize,
+ #define mpih_abs_cond(w,u,s,o) _gcry_mpih_abs_cond ((w),(u),(s),(o))
+ #define mpih_mod(v,vs,u,us) _gcry_mpih_mod ((v),(vs),(u),(us))
+ 
++static inline int
++mpih_limb_is_zero (mpi_limb_t a)
++{
++  /* Sign bit set if A == 0. */
++  a = ~a & ~(-a);
++
++  return a >> (BITS_PER_MPI_LIMB - 1);
++}
++
+ void _gcry_mpih_set_cond (mpi_ptr_t wp, mpi_ptr_t up, mpi_size_t usize,
+                           unsigned long op_enable);
+ mpi_limb_t _gcry_mpih_add_n_cond (mpi_ptr_t wp, mpi_ptr_t up, mpi_ptr_t vp,
+diff --git a/mpi/mpih-const-time.c b/mpi/mpih-const-time.c
+index 85dba389..3d854e8c 100644
+--- a/mpi/mpih-const-time.c
++++ b/mpi/mpih-const-time.c
+@@ -202,7 +202,7 @@ _gcry_mpih_cmp_ui (mpi_ptr_t up, mpi_size_t usize, unsigned long v)
+   mpi_size_t i;
+ 
+   for (i = 1; i < usize; i++)
+-    is_all_zero &= (up[i] == 0);
++    is_all_zero &= mpih_limb_is_zero (up[i]);
+ 
+   if (is_all_zero)
+     {
+-- 
+2.44.0
+
+From 5c5ba1ec2b505726ee1311339ac9e8b5c62cac4a Mon Sep 17 00:00:00 2001
+From: Jussi Kivilinna <jussi.kivilinna@iki.fi>
+Date: Wed, 1 Nov 2023 22:02:44 +0200
+Subject: [PATCH] ec-nist: use global vone and vzero
+
+* mpi/ec-nist.c (vzero, vone): Remove.
+(_gcry_mpi_ec_nist192_mod, _gcry_mpi_ec_nist224_mod)
+(_gcry_mpi_ec_nist256_mod, _gcry_mpi_ec_nist384_mod): Use _gcry_ct_vzero
+and _gcry_ct_vone.
+--
+
+Signed-off-by: Jussi Kivilinna <jussi.kivilinna@iki.fi>
+---
+ mpi/ec-nist.c | 26 ++++++++++----------------
+ 1 file changed, 10 insertions(+), 16 deletions(-)
+
+diff --git a/mpi/ec-nist.c b/mpi/ec-nist.c
+index 14e3c3ab..a822af76 100644
+--- a/mpi/ec-nist.c
++++ b/mpi/ec-nist.c
+@@ -32,13 +32,7 @@
+ #include "context.h"
+ #include "ec-context.h"
+ #include "ec-inline.h"
+-
+-
+-/* These variables are used to generate masks from conditional operation
+- * flag parameters.  Use of volatile prevents compiler optimizations from
+- * converting AND-masking to conditional branches.  */
+-static volatile mpi_limb_t vzero = 0;
+-static volatile mpi_limb_t vone = 1;
++#include "const-time.h"
+ 
+ 
+ static inline
+@@ -147,8 +141,8 @@ _gcry_mpi_ec_nist192_mod (gcry_mpi_t w, mpi_ec_t ctx)
+ 
+   s_is_negative = LO32_LIMB64(s[3]) >> 31;
+ 
+-  mask2 = vzero - s_is_negative;
+-  mask1 = s_is_negative - vone;
++  mask2 = _gcry_ct_vzero - s_is_negative;
++  mask1 = s_is_negative - _gcry_ct_vone;
+ 
+   STORE64_COND(wp, 0, mask2, o[0], mask1, s[0]);
+   STORE64_COND(wp, 1, mask2, o[1], mask1, s[1]);
+@@ -270,8 +264,8 @@ _gcry_mpi_ec_nist224_mod (gcry_mpi_t w, mpi_ec_t ctx)
+ 
+   s_is_negative = (HI32_LIMB64(s[3]) >> 31);
+ 
+-  mask2 = vzero - s_is_negative;
+-  mask1 = s_is_negative - vone;
++  mask2 = _gcry_ct_vzero - s_is_negative;
++  mask1 = s_is_negative - _gcry_ct_vone;
+ 
+   STORE64_COND(wp, 0, mask2, d[0], mask1, s[0]);
+   STORE64_COND(wp, 1, mask2, d[1], mask1, s[1]);
+@@ -499,9 +493,9 @@ _gcry_mpi_ec_nist256_mod (gcry_mpi_t w, mpi_ec_t ctx)
+ 
+   s_is_negative = LO32_LIMB64(s[4]) >> 31;
+   d_is_negative = LO32_LIMB64(d[4]) >> 31;
+-  mask3 = vzero - d_is_negative;
+-  mask2 = (vzero - s_is_negative) & ~mask3;
+-  mask1 = (s_is_negative - vone) & ~mask3;
++  mask3 = _gcry_ct_vzero - d_is_negative;
++  mask2 = (_gcry_ct_vzero - s_is_negative) & ~mask3;
++  mask1 = (s_is_negative - _gcry_ct_vone) & ~mask3;
+ 
+   s[0] = LIMB_OR64(MASK_AND64(mask2, d[0]), MASK_AND64(mask1, s[0]));
+   s[1] = LIMB_OR64(MASK_AND64(mask2, d[1]), MASK_AND64(mask1, s[1]));
+@@ -770,8 +764,8 @@ _gcry_mpi_ec_nist384_mod (gcry_mpi_t w, mpi_ec_t ctx)
+ 	       p_mult[0 + 3][1], p_mult[0 + 3][0]);
+ 
+   s_is_negative = LO32_LIMB64(s[6]) >> 31;
+-  mask2 = vzero - s_is_negative;
+-  mask1 = s_is_negative - vone;
++  mask2 = _gcry_ct_vzero - s_is_negative;
++  mask1 = s_is_negative - _gcry_ct_vone;
+ 
+   STORE64_COND(wp, 0, mask2, d[0], mask1, s[0]);
+   STORE64_COND(wp, 1, mask2, d[1], mask1, s[1]);
+-- 
+2.44.0
+
+From cf757cf90e9ae966b95dcebfd2f31b9212697f0c Mon Sep 17 00:00:00 2001
+From: Jussi Kivilinna <jussi.kivilinna@iki.fi>
+Date: Thu, 2 Nov 2023 20:38:04 +0200
+Subject: [PATCH] const-time: add functions for generating masks from 0/1 input
+
+* mpi/ec-nist.c (_gcry_mpi_ec_nist192_mod, _gcry_mpi_ec_nist224_mod)
+(_gcry_mpi_ec_nist256_mod, _gcry_mpi_ec_nist384_mod): Use mask generating
+functions.
+* mpi/mpi-internal.h (ct_limb_gen_mask, ct_limb_gen_inv_mask): New.
+* mpi/mpih-const-time.c (_gcry_mpih_set_cond, _gcry_mpih_add_n_cond)
+(_gcry_mpih_sub_n_cond, _gcry_mpih_sub_n_cond, _gcry_mpih_swap_cond): Use
+mask generating functions.
+* mpi/mpiutil.c (_gcry_mpi_set_cond, _gcry_mpi_swap_cond): Use mask
+generating functions.
+* src/const-time.h (DEFINE_CT_TYPE_GEN_MASK, ct_uintptr_gen_mask)
+(ct_ulong_gen_mask, DEFINE_CT_TYPE_GEN_INV_MASK, ct_uintptr_gen_inv_mask)
+(ct_ulong_gen_inv_mask): New.
+(DEFINE_CT_TYPE_SELECT_FUNC): Use mask generating functions.
+* src/const-time.c (_gcry_ct_memmov_cond): Use mask generating functions.
+--
+
+Provide functions for generating mask for constant time operations.
+
+Signed-off-by: Jussi Kivilinna <jussi.kivilinna@iki.fi>
+---
+ mpi/ec-nist.c         | 18 +++++++--------
+ mpi/mpi-internal.h    |  4 ++++
+ mpi/mpih-const-time.c | 20 ++++++++--------
+ mpi/mpiutil.c         |  8 +++----
+ src/const-time.c      |  6 +++--
+ src/const-time.h      | 54 +++++++++++++++++++++++++++++++++++++++++--
+ 6 files changed, 83 insertions(+), 27 deletions(-)
+
+diff --git a/mpi/ec-nist.c b/mpi/ec-nist.c
+index 6dfaa1da..3213f9df 100644
+--- a/mpi/ec-nist.c
++++ b/mpi/ec-nist.c
+@@ -141,8 +141,8 @@ _gcry_mpi_ec_nist192_mod (gcry_mpi_t w, mpi_ec_t ctx)
+ 
+   s_is_negative = LO32_LIMB64(s[3]) >> 31;
+ 
+-  mask2 = _gcry_ct_vzero - s_is_negative;
+-  mask1 = s_is_negative - _gcry_ct_vone;
++  mask2 = ct_limb_gen_mask(s_is_negative);
++  mask1 = ct_limb_gen_inv_mask(s_is_negative);
+ 
+   STORE64_COND(wp, 0, mask2, o[0], mask1, s[0]);
+   STORE64_COND(wp, 1, mask2, o[1], mask1, s[1]);
+@@ -264,8 +264,8 @@ _gcry_mpi_ec_nist224_mod (gcry_mpi_t w, mpi_ec_t ctx)
+ 
+   s_is_negative = (HI32_LIMB64(s[3]) >> 31);
+ 
+-  mask2 = _gcry_ct_vzero - s_is_negative;
+-  mask1 = s_is_negative - _gcry_ct_vone;
++  mask2 = ct_limb_gen_mask(s_is_negative);
++  mask1 = ct_limb_gen_inv_mask(s_is_negative);
+ 
+   STORE64_COND(wp, 0, mask2, d[0], mask1, s[0]);
+   STORE64_COND(wp, 1, mask2, d[1], mask1, s[1]);
+@@ -493,9 +493,9 @@ _gcry_mpi_ec_nist256_mod (gcry_mpi_t w, mpi_ec_t ctx)
+ 
+   s_is_negative = LO32_LIMB64(s[4]) >> 31;
+   d_is_negative = LO32_LIMB64(d[4]) >> 31;
+-  mask3 = _gcry_ct_vzero - d_is_negative;
+-  mask2 = (_gcry_ct_vzero - s_is_negative) & ~mask3;
+-  mask1 = (s_is_negative - _gcry_ct_vone) & ~mask3;
++  mask3 = ct_limb_gen_mask(d_is_negative);
++  mask2 = ct_limb_gen_mask(s_is_negative) & ~mask3;
++  mask1 = ct_limb_gen_inv_mask(s_is_negative) & ~mask3;
+ 
+   s[0] = LIMB_OR64(MASK_AND64(mask2, d[0]), MASK_AND64(mask1, s[0]));
+   s[1] = LIMB_OR64(MASK_AND64(mask2, d[1]), MASK_AND64(mask1, s[1]));
+@@ -764,8 +764,8 @@ _gcry_mpi_ec_nist384_mod (gcry_mpi_t w, mpi_ec_t ctx)
+ 	       p_mult[0 + 3][1], p_mult[0 + 3][0]);
+ 
+   s_is_negative = LO32_LIMB64(s[6]) >> 31;
+-  mask2 = _gcry_ct_vzero - s_is_negative;
+-  mask1 = s_is_negative - _gcry_ct_vone;
++  mask2 = ct_limb_gen_mask(s_is_negative);
++  mask1 = ct_limb_gen_inv_mask(s_is_negative);
+ 
+   STORE64_COND(wp, 0, mask2, d[0], mask1, s[0]);
+   STORE64_COND(wp, 1, mask2, d[1], mask1, s[1]);
+diff --git a/mpi/mpi-internal.h b/mpi/mpi-internal.h
+index 70045037..935bf3e1 100644
+--- a/mpi/mpi-internal.h
++++ b/mpi/mpi-internal.h
+@@ -50,6 +50,7 @@
+ #endif /*BITS_PER_MPI_LIMB*/
+ 
+ #include "mpi.h"
++#include "const-time.h"
+ 
+ /* If KARATSUBA_THRESHOLD is not already defined, define it to a
+  * value which is good on most machines.  */
+@@ -267,6 +268,9 @@ mpi_limb_t _gcry_mpih_rshift( mpi_ptr_t wp, mpi_ptr_t up, mpi_size_t usize,
+ #define mpih_abs_cond(w,u,s,o) _gcry_mpih_abs_cond ((w),(u),(s),(o))
+ #define mpih_mod(v,vs,u,us) _gcry_mpih_mod ((v),(vs),(u),(us))
+ 
++DEFINE_CT_TYPE_GEN_MASK(limb, mpi_limb_t)
++DEFINE_CT_TYPE_GEN_INV_MASK(limb, mpi_limb_t)
++
+ static inline int
+ mpih_limb_is_zero (mpi_limb_t a)
+ {
+diff --git a/mpi/mpih-const-time.c b/mpi/mpih-const-time.c
+index 3d854e8c..4f563cb8 100644
+--- a/mpi/mpih-const-time.c
++++ b/mpi/mpih-const-time.c
+@@ -36,8 +36,8 @@ _gcry_mpih_set_cond (mpi_ptr_t wp, mpi_ptr_t up, mpi_size_t usize,
+                      unsigned long op_enable)
+ {
+   /* Note: dual mask with AND/OR used for EM leakage mitigation */
+-  mpi_limb_t mask1 = _gcry_ct_vzero - op_enable;
+-  mpi_limb_t mask2 = op_enable - _gcry_ct_vone;
++  mpi_limb_t mask1 = ct_limb_gen_mask(op_enable);
++  mpi_limb_t mask2 = ct_limb_gen_inv_mask(op_enable);
+   mpi_size_t i;
+ 
+   for (i = 0; i < usize; i++)
+@@ -56,8 +56,8 @@ _gcry_mpih_add_n_cond (mpi_ptr_t wp, mpi_ptr_t up, mpi_ptr_t vp,
+                        mpi_size_t usize, unsigned long op_enable)
+ {
+   /* Note: dual mask with AND/OR used for EM leakage mitigation */
+-  mpi_limb_t mask1 = _gcry_ct_vzero - op_enable;
+-  mpi_limb_t mask2 = op_enable - _gcry_ct_vone;
++  mpi_limb_t mask1 = ct_limb_gen_mask(op_enable);
++  mpi_limb_t mask2 = ct_limb_gen_inv_mask(op_enable);
+   mpi_size_t i;
+   mpi_limb_t cy;
+ 
+@@ -88,8 +88,8 @@ _gcry_mpih_sub_n_cond (mpi_ptr_t wp, mpi_ptr_t up, mpi_ptr_t vp,
+                        mpi_size_t usize, unsigned long op_enable)
+ {
+   /* Note: dual mask with AND/OR used for EM leakage mitigation */
+-  mpi_limb_t mask1 = _gcry_ct_vzero - op_enable;
+-  mpi_limb_t mask2 = op_enable - _gcry_ct_vone;
++  mpi_limb_t mask1 = ct_limb_gen_mask(op_enable);
++  mpi_limb_t mask2 = ct_limb_gen_inv_mask(op_enable);
+   mpi_size_t i;
+   mpi_limb_t cy;
+ 
+@@ -120,8 +120,8 @@ _gcry_mpih_swap_cond (mpi_ptr_t up, mpi_ptr_t vp, mpi_size_t usize,
+                       unsigned long op_enable)
+ {
+   /* Note: dual mask with AND/OR used for EM leakage mitigation */
+-  mpi_limb_t mask1 = _gcry_ct_vzero - op_enable;
+-  mpi_limb_t mask2 = op_enable - _gcry_ct_vone;
++  mpi_limb_t mask1 = ct_limb_gen_mask(op_enable);
++  mpi_limb_t mask2 = ct_limb_gen_inv_mask(op_enable);
+   mpi_size_t i;
+ 
+   for (i = 0; i < usize; i++)
+@@ -143,8 +143,8 @@ _gcry_mpih_abs_cond (mpi_ptr_t wp, mpi_ptr_t up, mpi_size_t usize,
+                      unsigned long op_enable)
+ {
+   /* Note: dual mask with AND/OR used for EM leakage mitigation */
+-  mpi_limb_t mask1 = _gcry_ct_vzero - op_enable;
+-  mpi_limb_t mask2 = op_enable - _gcry_ct_vone;
++  mpi_limb_t mask1 = ct_limb_gen_mask(op_enable);
++  mpi_limb_t mask2 = ct_limb_gen_inv_mask(op_enable);
+   mpi_limb_t cy = op_enable;
+   mpi_size_t i;
+ 
+diff --git a/mpi/mpiutil.c b/mpi/mpiutil.c
+index f7506718..07cef257 100644
+--- a/mpi/mpiutil.c
++++ b/mpi/mpiutil.c
+@@ -509,8 +509,8 @@ gcry_mpi_t
+ _gcry_mpi_set_cond (gcry_mpi_t w, const gcry_mpi_t u, unsigned long set)
+ {
+   /* Note: dual mask with AND/OR used for EM leakage mitigation */
+-  mpi_limb_t mask1 = _gcry_ct_vzero - set;
+-  mpi_limb_t mask2 = set - _gcry_ct_vone;
++  mpi_limb_t mask1 = ct_limb_gen_mask(set);
++  mpi_limb_t mask2 = ct_limb_gen_inv_mask(set);
+   mpi_size_t i;
+   mpi_size_t nlimbs = u->alloced;
+   mpi_limb_t xu;
+@@ -611,8 +611,8 @@ void
+ _gcry_mpi_swap_cond (gcry_mpi_t a, gcry_mpi_t b, unsigned long swap)
+ {
+   /* Note: dual mask with AND/OR used for EM leakage mitigation */
+-  mpi_limb_t mask1 = _gcry_ct_vzero - swap;
+-  mpi_limb_t mask2 = swap - _gcry_ct_vone;
++  mpi_limb_t mask1 = ct_limb_gen_mask(swap);
++  mpi_limb_t mask2 = ct_limb_gen_inv_mask(swap);
+   mpi_size_t i;
+   mpi_size_t nlimbs;
+   mpi_limb_t *ua = a->d;
+diff --git a/src/const-time.c b/src/const-time.c
+index 73bf8b40..0fb53a07 100644
+--- a/src/const-time.c
++++ b/src/const-time.c
+@@ -24,11 +24,13 @@
+ #include "const-time.h"
+ 
+ 
++#ifndef HAVE_GCC_ASM_VOLATILE_MEMORY
+ /* These variables are used to generate masks from conditional operation
+  * flag parameters.  Use of volatile prevents compiler optimizations from
+  * converting AND-masking to conditional branches.  */
+ volatile unsigned int _gcry_ct_vzero = 0;
+ volatile unsigned int _gcry_ct_vone = 1;
++#endif
+ 
+ 
+ /*
+@@ -75,8 +77,8 @@ _gcry_ct_memmov_cond (void *dst, const void *src, size_t len,
+ 		      unsigned long op_enable)
+ {
+   /* Note: dual mask with AND/OR used for EM leakage mitigation */
+-  unsigned char mask1 = _gcry_ct_vzero - op_enable;
+-  unsigned char mask2 = op_enable - _gcry_ct_vone;
++  unsigned char mask1 = ct_ulong_gen_mask(op_enable);
++  unsigned char mask2 = ct_ulong_gen_inv_mask(op_enable);
+   unsigned char *b_dst = dst;
+   const unsigned char *b_src = src;
+   size_t i;
+diff --git a/src/const-time.h b/src/const-time.h
+index e324dcb7..fe07cc7a 100644
+--- a/src/const-time.h
++++ b/src/const-time.h
+@@ -28,8 +28,10 @@
+ #define ct_memmov_cond _gcry_ct_memmov_cond
+ 
+ 
++#ifndef HAVE_GCC_ASM_VOLATILE_MEMORY
+ extern volatile unsigned int _gcry_ct_vzero;
+ extern volatile unsigned int _gcry_ct_vone;
++#endif
+ 
+ 
+ /*
+@@ -80,6 +82,54 @@ unsigned int _gcry_ct_not_memequal (const void *b1, const void *b2, size_t len);
+    any structure.  */
+ unsigned int _gcry_ct_memequal (const void *b1, const void *b2, size_t len);
+ 
++/*
++ * Return all bits set if A is 1 and return 0 otherwise.
++ */
++#ifdef HAVE_GCC_ASM_VOLATILE_MEMORY
++#  define DEFINE_CT_TYPE_GEN_MASK(name, type) \
++     static inline type \
++     ct_##name##_gen_mask (unsigned long op_enable) \
++     { \
++       type mask = -(type)op_enable; \
++       asm volatile ("\n" : "+r" (mask) :: "memory"); \
++       return mask; \
++     }
++#else
++#  define DEFINE_CT_TYPE_GEN_MASK(name, type) \
++     static inline type \
++     ct_##name##_gen_mask (unsigned long op_enable) \
++     { \
++       type mask = (type)_gcry_ct_vzero - (type)op_enable; \
++       return mask; \
++     }
++#endif
++DEFINE_CT_TYPE_GEN_MASK(uintptr, uintptr_t)
++DEFINE_CT_TYPE_GEN_MASK(ulong, unsigned long)
++
++/*
++ * Return all bits set if A is 0 and return 1 otherwise.
++ */
++#ifdef HAVE_GCC_ASM_VOLATILE_MEMORY
++#  define DEFINE_CT_TYPE_GEN_INV_MASK(name, type) \
++     static inline type \
++     ct_##name##_gen_inv_mask (unsigned long op_enable) \
++     { \
++       type mask = (type)op_enable - (type)1; \
++       asm volatile ("\n" : "+r" (mask) :: "memory"); \
++       return mask; \
++     }
++#else
++#  define DEFINE_CT_TYPE_GEN_INV_MASK(name, type) \
++     static inline type \
++     ct_##name##_gen_inv_mask (unsigned long op_enable) \
++     { \
++       type mask = (type)op_enable - (type)_gcry_ct_vone; \
++       return mask; \
++     }
++#endif
++DEFINE_CT_TYPE_GEN_INV_MASK(uintptr, uintptr_t)
++DEFINE_CT_TYPE_GEN_INV_MASK(ulong, unsigned long)
++
+ /*
+  *  Return A when OP_ENABLED=1
+  *  otherwise, return B
+@@ -88,8 +138,8 @@ unsigned int _gcry_ct_memequal (const void *b1, const void *b2, size_t len);
+   static inline type \
+   ct_##name##_select (type a, type b, unsigned long op_enable) \
+   { \
+-    type mask_b = (type)op_enable - (type)_gcry_ct_vone; \
+-    type mask_a = (type)_gcry_ct_vzero - (type)op_enable; \
++    type mask_b = ct_##name##_gen_inv_mask(op_enable); \
++    type mask_a = ct_##name##_gen_mask(op_enable); \
+     return (mask_a & a) | (mask_b & b); \
+   }
+ DEFINE_CT_TYPE_SELECT_FUNC(uintptr, uintptr_t)
+-- 
+2.44.0
+From c419a04d529af7b5fb43732ec2b4304166c2579a Mon Sep 17 00:00:00 2001
+From: Jussi Kivilinna <jussi.kivilinna@iki.fi>
+Date: Thu, 2 Nov 2023 20:59:24 +0200
+Subject: [PATCH] mpih-const-time: use constant-time comparisons conditional
+ add/sub/abs
+
+* mpi/mpih-const-time.c (mpih_ct_limb_greater_than)
+(mpih_ct_limb_less_than): New.
+(_gcry_mpih_add_n_cond, _gcry_mpih_sub_n_cond, _gcry_mpih_abs_cond): Use
+mpih_ct_limb_greater_than and mpih_ct_limb_less_than for comparisons.
+--
+
+Signed-off-by: Jussi Kivilinna <jussi.kivilinna@iki.fi>
+---
+ mpi/mpih-const-time.c | 33 ++++++++++++++++++++++++++++-----
+ 1 file changed, 28 insertions(+), 5 deletions(-)
+
+diff --git a/mpi/mpih-const-time.c b/mpi/mpih-const-time.c
+index 4f563cb8..26dc2d09 100644
+--- a/mpi/mpih-const-time.c
++++ b/mpi/mpih-const-time.c
+@@ -23,10 +23,33 @@
+ #include "mpi-internal.h"
+ #include "g10lib.h"
+ #include "const-time.h"
++#include "longlong.h"
+ 
+ #define A_LIMB_1 ((mpi_limb_t)1)
+ 
+ 
++/*
++ * Return 1 if X > Y and otherwise return 0.
++ */
++static inline mpi_limb_t
++mpih_ct_limb_greater_than (mpi_limb_t x, mpi_limb_t y)
++{
++  mpi_limb_t diff_hi, diff_lo;
++  sub_ddmmss (diff_hi, diff_lo, 0, y, 0, x);
++  return diff_hi >> (BITS_PER_MPI_LIMB - 1);
++}
++
++
++/*
++ * Return 1 if X < Y and otherwise return 0.
++ */
++static inline mpi_limb_t
++mpih_ct_limb_less_than (mpi_limb_t x, mpi_limb_t y)
++{
++  return mpih_ct_limb_greater_than (y, x);
++}
++
++
+ /*
+  *  W = U when OP_ENABLED=1
+  *  otherwise, W keeps old value
+@@ -66,11 +89,11 @@ _gcry_mpih_add_n_cond (mpi_ptr_t wp, mpi_ptr_t up, mpi_ptr_t vp,
+     {
+       mpi_limb_t u = up[i];
+       mpi_limb_t x = u + vp[i];
+-      mpi_limb_t cy1 = x < u;
++      mpi_limb_t cy1 = mpih_ct_limb_less_than(x, u);
+       mpi_limb_t cy2;
+ 
+       x = x + cy;
+-      cy2 = x < cy;
++      cy2 = mpih_ct_limb_less_than(x, cy);
+       cy = cy1 | cy2;
+       wp[i] = (u & mask2) | (x & mask1);
+     }
+@@ -98,10 +121,10 @@ _gcry_mpih_sub_n_cond (mpi_ptr_t wp, mpi_ptr_t up, mpi_ptr_t vp,
+     {
+       mpi_limb_t u = up[i];
+       mpi_limb_t x = u - vp[i];
+-      mpi_limb_t cy1 = x > u;
++      mpi_limb_t cy1 = mpih_ct_limb_greater_than(x, u);
+       mpi_limb_t cy2;
+ 
+-      cy2 = x < cy;
++      cy2 = mpih_ct_limb_less_than(x, cy);
+       x = x - cy;
+       cy = cy1 | cy2;
+       wp[i] = (u & mask2) | (x & mask1);
+@@ -153,7 +176,7 @@ _gcry_mpih_abs_cond (mpi_ptr_t wp, mpi_ptr_t up, mpi_size_t usize,
+       mpi_limb_t u = up[i];
+       mpi_limb_t x = ~u + cy;
+ 
+-      cy = (x < ~u);
++      cy = mpih_ct_limb_less_than(x, ~u);
+       wp[i] = (u & mask2) | (x & mask1);
+     }
+ }
+-- 
+2.44.0
+
+From 39d5364a9557d6f423de117601cb1e6414814f47 Mon Sep 17 00:00:00 2001
+From: Jussi Kivilinna <jussi.kivilinna@iki.fi>
+Date: Fri, 3 Nov 2023 21:31:08 +0200
+Subject: [PATCH] mpih_mod: avoid unintentional conditional branch
+
+* mpi/mpih-const-time.c (_gcry_mpih_mod): Avoid conditional branch
+on the_bit extraction.
+--
+
+Signed-off-by: Jussi Kivilinna <jussi.kivilinna@iki.fi>
+---
+ mpi/mpih-const-time.c | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/mpi/mpih-const-time.c b/mpi/mpih-const-time.c
+index 26dc2d09..e5422409 100644
+--- a/mpi/mpih-const-time.c
++++ b/mpi/mpih-const-time.c
+@@ -204,7 +204,7 @@ _gcry_mpih_mod (mpi_ptr_t vp, mpi_size_t vsize,
+       unsigned int limbno = j / BITS_PER_MPI_LIMB;
+       unsigned int bitno = j % BITS_PER_MPI_LIMB;
+       mpi_limb_t limb = vp[limbno];
+-      unsigned int the_bit = ((limb & (A_LIMB_1 << bitno)) ? 1 : 0);
++      unsigned int the_bit = (limb >> bitno) & 1;
+       mpi_limb_t underflow;
+       mpi_limb_t overflow;
+ 
+-- 
+2.44.0
+

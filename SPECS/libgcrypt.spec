@@ -16,7 +16,7 @@ print(string.sub(hash, 0, 16))
 
 Name: libgcrypt
 Version: 1.10.0
-Release: 10%{?dist}
+Release: 11%{?dist}
 URL: https://www.gnupg.org/
 Source0: https://www.gnupg.org/ftp/gcrypt/libgcrypt/libgcrypt-%{version}.tar.bz2
 Source1: https://www.gnupg.org/ftp/gcrypt/libgcrypt/libgcrypt-%{version}.tar.bz2.sig
@@ -63,6 +63,31 @@ Patch19: libgcrypt-1.10.0-fips-status-sign-verify.patch
 Patch20: libgcrypt-1.10.0-fips-drbg.patch
 # https://dev.gnupg.org/T6417
 Patch21: libgcrypt-1.10.0-fips-indicator-pk-flags.patch
+# a611e3a25d61505698e2bb38ec2db38bc6a74820
+# 34c20427926010d6fa95b1666e4b1b60f60a8742
+# c848459e512615c1865a23cf24debb3ad4a1e85b
+# c31b70b2660c3d24bd54ee08c255c36d867fdea7
+# bd08357436a9559766cd458d25781ee4f94012a2
+# 58b62be844549ad3d57c507d834027f1e2756567
+# 6d1d50ba3aad1850975f717adbedb4cb8b236fa7
+# 1e9ddbd65c4627235611d75c3198c4ec197c9a05
+# 137e35ad47ee8734d0f3ffb6af1d1669c4621e0b
+# 84f934c09afac18b3f4351646c0fe6f93aede277
+# 0c6ec6bbe788b8c4a6982b2128d442b51323c898
+# 22dde5150ee2be01651410ed9756601ba6a29c93
+# 4d3e0e30b98b2acb90acb2792b8327c26824a66f
+# 179df341162c74da312f76363a0ff1f2f303aa78
+# d4aee9ace9a904446b987dddc2999119c4d62dae
+# aab6a42d5f44724b73a02598546a5e7d8b33298e
+# 5c5ba1ec2b505726ee1311339ac9e8b5c62cac4a
+# cf757cf90e9ae966b95dcebfd2f31b9212697f0c
+# c419a04d529af7b5fb43732ec2b4304166c2579a
+# 39d5364a9557d6f423de117601cb1e6414814f47
+Patch22: libgcrypt-1.10.0-marvin.patch
+# f490ffd739f713fcf0be35b7fbbb8502dea40a0c
+Patch23: libgcrypt-1.10.0-marvin2.patch
+# https://gitlab.com/redhat-crypto/libgcrypt/libgcrypt-mirror/-/merge_requests/19/
+Patch24: libgcrypt-1.10.0-marvin3.patch
 
 %global gcrylibdir %{_libdir}
 %global gcrysoname libgcrypt.so.20
@@ -117,6 +142,9 @@ applications using libgcrypt.
 %patch19 -p1
 %patch20 -p1
 %patch21 -p1
+%patch22 -p1
+%patch23 -p1
+%patch24 -p1
 
 %build
 # This package has a configure test which uses ASMs, but does not link the
@@ -146,6 +174,7 @@ autoreconf -f
      --disable-jent-support \
      --enable-digests="$DIGESTS" \
      --enable-ciphers="$CIPHERS" \
+     --enable-marvin-workaround \
      --with-fips-module-version="$FIPS_MODULE_NAME %{version}-%{srpmhash}"
 sed -i -e '/^sys_lib_dlsearch_path_spec/s,/lib /usr/lib,/usr/lib /lib64 /usr/lib64 /lib,g' libtool
 %make_build
@@ -236,6 +265,9 @@ mkdir -p -m 755 $RPM_BUILD_ROOT/etc/gcrypt
 %license COPYING
 
 %changelog
+* Thu Aug 01 2024 Jakub Jelen <jjelen@redhat.com> - 1.10.0-11
+- Fix CVE-2024-2236 (RHEL-34579)
+
 * Mon Mar 20 2023 Jakub Jelen <jjelen@redhat.com> - 1.10.0-10
 - Provide FIPS indicators for MD and HMACs
 - Improve PCT tests for ECDSA and always run them after key is generated
