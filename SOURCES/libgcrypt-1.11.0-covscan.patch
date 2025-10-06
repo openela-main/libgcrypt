@@ -1,0 +1,109 @@
+From 03a0535661186ba1cf853a6b43ff2b2a5e42a3ea Mon Sep 17 00:00:00 2001
+From: Jakub Jelen <jjelen@redhat.com>
+Date: Thu, 25 Jul 2024 14:21:04 +0200
+Subject: [PATCH 2/3] sexp: Avoid memory leaks on invalid input
+
+* src/sexp.c (_gcry_hex2buffer): Free buffer on error.
+--
+
+Signed-off-by: Jakub Jelen <jjelen@redhat.com>
+---
+ src/sexp.c | 5 ++++-
+ 1 file changed, 4 insertions(+), 1 deletion(-)
+
+diff --git a/src/sexp.c b/src/sexp.c
+index b15cb486..60ddcbc3 100644
+--- a/src/sexp.c
++++ b/src/sexp.c
+@@ -2715,7 +2715,10 @@ _gcry_hex2buffer (const char *string, size_t *r_length)
+   for (s=string; *s; s +=2 )
+     {
+       if (!hexdigitp (s) || !hexdigitp (s+1))
+-        return NULL;           /* Invalid hex digits. */
++        {
++          xfree(buffer);
++          return NULL;           /* Invalid hex digits. */
++        }
+       ((unsigned char*)buffer)[length++] = xtoi_2 (s);
+     }
+   *r_length = length;
+-- 
+GitLab
+
+
+From 45d77a0ed6dcacbfaf6e72f6402705f4635e5cf8 Mon Sep 17 00:00:00 2001
+From: Jakub Jelen <jjelen@redhat.com>
+Date: Thu, 25 Jul 2024 14:32:19 +0200
+Subject: [PATCH 3/3] ecdh: Avoid memory leaks
+
+* cipher/ecc-ecdh.c (_gcry_ecc_curve_keypair): Free buffer on exit path.
+  (_gcry_ecc_curve_mul_point): Free buffer on all exit paths.
+--
+
+Signed-off-by: Jakub Jelen <jjelen@redhat.com>
+---
+ cipher/ecc-ecdh.c | 13 ++++++-------
+ 1 file changed, 6 insertions(+), 7 deletions(-)
+
+diff --git a/cipher/ecc-ecdh.c b/cipher/ecc-ecdh.c
+index 8be57b72..c690d221 100644
+--- a/cipher/ecc-ecdh.c
++++ b/cipher/ecc-ecdh.c
+@@ -153,6 +153,7 @@ _gcry_ecc_curve_keypair (const char *curve,
+           buf = _gcry_mpi_get_buffer (mpi_k, 0, &len, NULL);
+           memset (seckey, 0, nbytes - len);
+           memcpy (seckey + nbytes - len, buf, len);
++          xfree (buf);
+         }
+       else /* p - y >= p */
+         mpi_free (negative);
+@@ -168,15 +169,14 @@ _gcry_ecc_curve_keypair (const char *curve,
+           if (len != 1 + 2*nbytes)
+             {
+               err = GPG_ERR_INV_ARG;
+-              mpi_free (y);
+             }
+           else
+             {
+               /* (x,y) in SEC1 point encoding.  */
+               memcpy (pubkey, buf, len);
+-              xfree (buf);
+-              mpi_free (y);
+             }
++          xfree (buf);
++          mpi_free (y);
+         }
+     }
+   else /* MPI_EC_MONTGOMERY */
+@@ -293,15 +293,14 @@ _gcry_ecc_curve_mul_point (const char *curve,
+           if (len != 1 + 2*nbytes)
+             {
+               err = GPG_ERR_INV_ARG;
+-              mpi_free (y);
+             }
+           else
+             {
+               /* (x,y) in SEC1 point encoding.  */
+               memcpy (result, buf, len);
+-              xfree (buf);
+-              mpi_free (y);
+             }
++          xfree (buf);
++          mpi_free (y);
+         }
+     }
+   else                          /* MPI_EC_MONTGOMERY */
+@@ -318,8 +317,8 @@ _gcry_ecc_curve_mul_point (const char *curve,
+             {
+               /* x in little endian.  */
+               memcpy (result, buf, nbytes);
+-              xfree (buf);
+             }
++          xfree (buf);
+         }
+     }
+   mpi_free (x);
+-- 
+GitLab
+
+

@@ -1,0 +1,328 @@
+From 7ee2e73495d051ca09dd57c90132a7a9cc53bc62 Mon Sep 17 00:00:00 2001
+From: Jussi Kivilinna <jussi.kivilinna@iki.fi>
+Date: Fri, 26 Jul 2024 11:00:30 +0300
+Subject: [PATCH] asm-common-amd64: add missing CFI directives for large memory
+ model code
+
+* cipher/asm-common-amd64.h [__code_model_large__]
+(GET_EXTERN_POINTER): Add CFI_PUSH/CFI_POP directives.
+--
+
+Signed-off-by: Jussi Kivilinna <jussi.kivilinna@iki.fi>
+---
+ cipher/asm-common-amd64.h | 6 +++++-
+ 1 file changed, 5 insertions(+), 1 deletion(-)
+
+diff --git a/cipher/asm-common-amd64.h b/cipher/asm-common-amd64.h
+index 870fef9a..3fa065e8 100644
+--- a/cipher/asm-common-amd64.h
++++ b/cipher/asm-common-amd64.h
+@@ -59,14 +59,18 @@
+ #  ifdef __code_model_large__
+ #    define GET_EXTERN_POINTER(name, reg) \
+ 	       pushq %r15; \
++	       CFI_PUSH(%r15); \
+ 	       pushq %r14; \
++	       CFI_PUSH(%r14); \
+ 	    1: leaq 1b(%rip), reg; \
+ 	       movabsq $_GLOBAL_OFFSET_TABLE_-1b, %r14; \
+ 	       movabsq $name@GOT, %r15; \
+ 	       addq %r14, reg; \
+ 	       popq %r14; \
++	       CFI_POP(%r14); \
+ 	       movq (reg, %r15), reg; \
+-	       popq %r15;
++	       popq %r15; \
++	       CFI_POP(%r15);
+ #  else
+ #    define GET_EXTERN_POINTER(name, reg) movq name@GOTPCREL(%rip), reg
+ #  endif
+-- 
+2.45.2
+
+From dd42a4e03e066c49a6d83e0d3a07e4261d77121a Mon Sep 17 00:00:00 2001
+From: Jussi Kivilinna <jussi.kivilinna@iki.fi>
+Date: Sat, 27 Jul 2024 08:16:56 +0300
+Subject: [PATCH] Do not build i386 assembly on x86-64
+
+* configure.ac: Enable building i386 "rijndael-vaes" only
+on i?86 host instead of x86 MPI arch ("i?86 + x86-64").
+--
+
+GnuPG-bug-id: 7220
+Signed-off-by: Jussi Kivilinna <jussi.kivilinna@iki.fi>
+---
+ configure.ac | 9 +++++----
+ 1 file changed, 5 insertions(+), 4 deletions(-)
+
+diff --git a/configure.ac b/configure.ac
+index d3dffb4b..1e182552 100644
+--- a/configure.ac
++++ b/configure.ac
+@@ -3025,6 +3025,11 @@ if test "$found" = "1" ; then
+    AC_DEFINE(USE_AES, 1, [Defined if this module should be included])
+ 
+    case "${host}" in
++      i?86-*-*)
++         # Build with the VAES/AVX2 implementation
++         GCRYPT_ASM_CIPHERS="$GCRYPT_ASM_CIPHERS rijndael-vaes-i386.lo"
++         GCRYPT_ASM_CIPHERS="$GCRYPT_ASM_CIPHERS rijndael-vaes-avx2-i386.lo"
++      ;;
+       x86_64-*-*)
+          # Build with the assembly implementation
+          GCRYPT_ASM_CIPHERS="$GCRYPT_ASM_CIPHERS rijndael-amd64.lo"
+@@ -3089,10 +3094,6 @@ if test "$found" = "1" ; then
+ 
+          # Build with the Padlock implementation
+          GCRYPT_ASM_CIPHERS="$GCRYPT_ASM_CIPHERS rijndael-padlock.lo"
+-
+-         # Build with the VAES/AVX2 implementation
+-         GCRYPT_ASM_CIPHERS="$GCRYPT_ASM_CIPHERS rijndael-vaes-i386.lo"
+-         GCRYPT_ASM_CIPHERS="$GCRYPT_ASM_CIPHERS rijndael-vaes-avx2-i386.lo"
+       ;;
+    esac
+ fi
+-- 
+2.45.2
+
+From 5797d75e3b916caf504bed73a8629c6c168be58d Mon Sep 17 00:00:00 2001
+From: Jussi Kivilinna <jussi.kivilinna@iki.fi>
+Date: Sat, 27 Jul 2024 08:50:57 +0300
+Subject: [PATCH] Do not build amd64 assembly on i386
+
+* configure.ac: Build "serpent-avx2-amd64" and
+"camellia-*-amd64" only on x86-64.
+--
+
+GnuPG-bug-id: 7220
+Signed-off-by: Jussi Kivilinna <jussi.kivilinna@iki.fi>
+---
+ configure.ac | 50 +++++++++++++++++++++++++++-----------------------
+ 1 file changed, 27 insertions(+), 23 deletions(-)
+
+diff --git a/configure.ac b/configure.ac
+index 1e182552..191aa38d 100644
+--- a/configure.ac
++++ b/configure.ac
+@@ -3133,14 +3133,14 @@ if test "$found" = "1" ; then
+       x86_64-*-*)
+          # Build with the SSE2 implementation
+          GCRYPT_ASM_CIPHERS="$GCRYPT_ASM_CIPHERS serpent-sse2-amd64.lo"
++
++         if test x"$avx2support" = xyes ; then
++            # Build with the AVX2 implementation
++            GCRYPT_ASM_CIPHERS="$GCRYPT_ASM_CIPHERS serpent-avx2-amd64.lo"
++         fi
+       ;;
+    esac
+ 
+-   if test x"$avx2support" = xyes ; then
+-      # Build with the AVX2 implementation
+-      GCRYPT_ASM_CIPHERS="$GCRYPT_ASM_CIPHERS serpent-avx2-amd64.lo"
+-   fi
+-
+    if test x"$avx512support" = xyes ; then
+       # Build with the AVX512 implementation
+       GCRYPT_ASM_CIPHERS="$GCRYPT_ASM_CIPHERS serpent-avx512-x86.lo"
+@@ -3186,28 +3186,32 @@ if test "$found" = "1" ; then
+       ;;
+    esac
+ 
+-   if test x"$avxsupport" = xyes ; then
+-      if test x"$aesnisupport" = xyes ; then
+-        # Build with the AES-NI/AVX implementation
+-        GCRYPT_ASM_CIPHERS="$GCRYPT_ASM_CIPHERS camellia-aesni-avx-amd64.lo"
+-      fi
+-   fi
++   case "${host}" in
++      x86_64-*-*)
++         if test x"$avxsupport" = xyes ; then
++            if test x"$aesnisupport" = xyes ; then
++              # Build with the AES-NI/AVX implementation
++              GCRYPT_ASM_CIPHERS="$GCRYPT_ASM_CIPHERS camellia-aesni-avx-amd64.lo"
++            fi
++         fi
+ 
+-   if test x"$avx2support" = xyes ; then
+-      if test x"$aesnisupport" = xyes ; then
+-        # Build with the AES-NI/AVX2 implementation
+-        GCRYPT_ASM_CIPHERS="$GCRYPT_ASM_CIPHERS camellia-aesni-avx2-amd64.lo"
++         if test x"$avx2support" = xyes ; then
++            if test x"$aesnisupport" = xyes ; then
++              # Build with the AES-NI/AVX2 implementation
++              GCRYPT_ASM_CIPHERS="$GCRYPT_ASM_CIPHERS camellia-aesni-avx2-amd64.lo"
+ 
+-        # Build with the VAES/AVX2 implementation
+-        GCRYPT_ASM_CIPHERS="$GCRYPT_ASM_CIPHERS camellia-vaes-avx2-amd64.lo"
++              # Build with the VAES/AVX2 implementation
++              GCRYPT_ASM_CIPHERS="$GCRYPT_ASM_CIPHERS camellia-vaes-avx2-amd64.lo"
+ 
+-        # Build with the GFNI/AVX2 implementation
+-        GCRYPT_ASM_CIPHERS="$GCRYPT_ASM_CIPHERS camellia-gfni-avx2-amd64.lo"
++              # Build with the GFNI/AVX2 implementation
++              GCRYPT_ASM_CIPHERS="$GCRYPT_ASM_CIPHERS camellia-gfni-avx2-amd64.lo"
+ 
+-        # Build with the GFNI/AVX512 implementation
+-        GCRYPT_ASM_CIPHERS="$GCRYPT_ASM_CIPHERS camellia-gfni-avx512-amd64.lo"
+-      fi
+-   fi
++              # Build with the GFNI/AVX512 implementation
++              GCRYPT_ASM_CIPHERS="$GCRYPT_ASM_CIPHERS camellia-gfni-avx512-amd64.lo"
++            fi
++         fi
++      ;;
++   esac
+ fi
+ 
+ LIST_MEMBER(idea, $enabled_ciphers)
+-- 
+2.45.2
+
+From d69e6a29b986cf1cb21e09d337a0de2564ef34f2 Mon Sep 17 00:00:00 2001
+From: Jussi Kivilinna <jussi.kivilinna@iki.fi>
+Date: Fri, 26 Jul 2024 10:59:12 +0300
+Subject: [PATCH] Add CET support for x86-64 assembly
+
+* cipher/asm-common-amd64.h (ENDBRANCH): New.
+(CFI_STARTPROC): Add ENDBRANCH.
+[__CET__] (note.gnu.property): Add CET property section.
+--
+
+GnuPG-bug-id: 7220
+Signed-off-by: Jussi Kivilinna <jussi.kivilinna@iki.fi>
+---
+ cipher/asm-common-amd64.h | 30 ++++++++++++++++++++++++++++--
+ 1 file changed, 28 insertions(+), 2 deletions(-)
+
+diff --git a/cipher/asm-common-amd64.h b/cipher/asm-common-amd64.h
+index 3fa065e8..465ef62b 100644
+--- a/cipher/asm-common-amd64.h
++++ b/cipher/asm-common-amd64.h
+@@ -76,9 +76,15 @@
+ #  endif
+ #endif
+ 
++#ifdef __CET__
++#define ENDBRANCH endbr64
++#else
++#define ENDBRANCH /*_*/
++#endif
++
+ #ifdef HAVE_GCC_ASM_CFI_DIRECTIVES
+ /* CFI directives to emit DWARF stack unwinding information. */
+-# define CFI_STARTPROC()            .cfi_startproc
++# define CFI_STARTPROC()            .cfi_startproc; ENDBRANCH
+ # define CFI_ENDPROC()              .cfi_endproc
+ # define CFI_REMEMBER_STATE()       .cfi_remember_state
+ # define CFI_RESTORE_STATE()        .cfi_restore_state
+@@ -146,7 +152,7 @@
+ 	    DW_SLEB128_28BIT(rsp_offs)
+ 
+ #else
+-# define CFI_STARTPROC()
++# define CFI_STARTPROC() ENDBRANCH
+ # define CFI_ENDPROC()
+ # define CFI_REMEMBER_STATE()
+ # define CFI_RESTORE_STATE()
+@@ -214,4 +220,24 @@
+ 	vpopcntb xmm16, xmm16; /* Supported only by newer AVX512 CPUs. */ \
+ 	vpxord ymm16, ymm16, ymm16;
+ 
++#ifdef __CET__
++/* Generate CET property for all assembly files including this header. */
++ELF(.section .note.gnu.property,"a")
++ELF(.align 8)
++ELF(.long 1f - 0f)
++ELF(.long 4f - 1f)
++ELF(.long 5)
++ELF(0:)
++ELF(.byte 0x47, 0x4e, 0x55, 0) /* string "GNU" */
++ELF(1:)
++ELF(.align 8)
++ELF(.long 0xc0000002)
++ELF(.long 3f - 2f)
++ELF(2:)
++ELF(.long 0x3)
++ELF(3:)
++ELF(.align 8)
++ELF(4:)
++#endif
++
+ #endif /* GCRY_ASM_COMMON_AMD64_H */
+-- 
+2.45.2
+
+From 64ec13d11b08fbe31cc6f83e9464e7e251d41019 Mon Sep 17 00:00:00 2001
+From: Jussi Kivilinna <jussi.kivilinna@iki.fi>
+Date: Fri, 26 Jul 2024 11:09:37 +0300
+Subject: [PATCH] Add CET support for i386 assembly
+
+* cipher/asm-common-i386.h (ENDBRANCH): New.
+(CFI_STARTPROC): Add ENDBRANCH.
+[__CET__] (note.gnu.property): Add CET property section.
+--
+
+GnuPG-bug-id: 7220
+Signed-off-by: Jussi Kivilinna <jussi.kivilinna@iki.fi>
+---
+ cipher/asm-common-i386.h | 30 ++++++++++++++++++++++++++++--
+ 1 file changed, 28 insertions(+), 2 deletions(-)
+
+diff --git a/cipher/asm-common-i386.h b/cipher/asm-common-i386.h
+index d746ebc4..346a8ff2 100644
+--- a/cipher/asm-common-i386.h
++++ b/cipher/asm-common-i386.h
+@@ -59,9 +59,15 @@
+ 	movl name##@GOT(%reg), %reg;
+ #endif
+ 
++#ifdef __CET__
++#define ENDBRANCH endbr32
++#else
++#define ENDBRANCH /*_*/
++#endif
++
+ #ifdef HAVE_GCC_ASM_CFI_DIRECTIVES
+ /* CFI directives to emit DWARF stack unwinding information. */
+-# define CFI_STARTPROC()            .cfi_startproc
++# define CFI_STARTPROC()            .cfi_startproc; ENDBRANCH
+ # define CFI_ENDPROC()              .cfi_endproc
+ # define CFI_REMEMBER_STATE()       .cfi_remember_state
+ # define CFI_RESTORE_STATE()        .cfi_restore_state
+@@ -121,7 +127,7 @@
+ 	    DW_SLEB128_28BIT(esp_offs)
+ 
+ #else
+-# define CFI_STARTPROC()
++# define CFI_STARTPROC() ENDBRANCH
+ # define CFI_ENDPROC()
+ # define CFI_REMEMBER_STATE()
+ # define CFI_RESTORE_STATE()
+@@ -158,4 +164,24 @@
+ 	vpopcntb xmm7, xmm7; /* Supported only by newer AVX512 CPUs. */ \
+ 	vpxord ymm7, ymm7, ymm7;
+ 
++#ifdef __CET__
++/* Generate CET property for all assembly files including this header. */
++ELF(.section .note.gnu.property,"a")
++ELF(.align 4)
++ELF(.long 1f - 0f)
++ELF(.long 4f - 1f)
++ELF(.long 5)
++ELF(0:)
++ELF(.byte 0x47, 0x4e, 0x55, 0) /* string "GNU" */
++ELF(1:)
++ELF(.align 4)
++ELF(.long 0xc0000002)
++ELF(.long 3f - 2f)
++ELF(2:)
++ELF(.long 0x3)
++ELF(3:)
++ELF(.align 4)
++ELF(4:)
++#endif
++
+ #endif /* GCRY_ASM_COMMON_AMD64_H */
+-- 
+2.45.2
+
