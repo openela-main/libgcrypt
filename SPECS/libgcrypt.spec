@@ -1,6 +1,6 @@
 Name: libgcrypt
 Version: 1.8.5
-Release: 7%{?dist}
+Release: 8%{?dist}
 URL: http://www.gnupg.org/
 Source0: libgcrypt-%{version}-hobbled.tar.xz
 # The original libgcrypt sources now contain potentially patented ECC
@@ -69,6 +69,8 @@ Patch38: libgcrypt-1.8.5-fips-hwfeatures.patch
 Patch39: libgcrypt-1.8.5-ppc-chacha20-poly1305.patch
 # Fix CVE-2021-33560 (elgamal blinding)
 Patch40: libgcrypt-1.8.5-elgamal-blinding.patch
+# https://dev.gnupg.org/T8211.html
+Patch41: libgcrypt-1.8.5-montgomery-zeroes.patch
 
 %define gcrylibdir %{_libdir}
 
@@ -130,6 +132,7 @@ applications using libgcrypt.
 %patch38 -p1 -b .hw-fips
 %patch39 -p1 -b .ppc-chacha
 %patch40 -p1 -b .elgamal-blinding
+%patch41 -p1 -b .montgomery-zeroes
 
 cp %{SOURCE4} cipher/
 cp %{SOURCE5} %{SOURCE6} tests/
@@ -245,6 +248,9 @@ exit 0
 %license COPYING
 
 %changelog
+* Mon Jun 29 2026 Jakub Jelen <jjelen@redhat.com> - 1.8.5-8
+- Fix CVE-2026-41989: Denial of Service and buffer overflow via crafted ECDH ciphertext
+
 * Tue Apr 05 2022 Jakub Jelen <jjelen@redhat.com> - 1.8.5-7
 - Fix CVE-2021-33560 (#2018525)
 
