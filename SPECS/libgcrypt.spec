@@ -16,7 +16,7 @@ print(string.sub(hash, 0, 16))
 
 Name: libgcrypt
 Version: 1.10.0
-Release: 11%{?dist}
+Release: 13%{?dist}
 URL: https://www.gnupg.org/
 Source0: https://www.gnupg.org/ftp/gcrypt/libgcrypt/libgcrypt-%{version}.tar.bz2
 Source1: https://www.gnupg.org/ftp/gcrypt/libgcrypt/libgcrypt-%{version}.tar.bz2.sig
@@ -88,6 +88,8 @@ Patch22: libgcrypt-1.10.0-marvin.patch
 Patch23: libgcrypt-1.10.0-marvin2.patch
 # https://gitlab.com/redhat-crypto/libgcrypt/libgcrypt-mirror/-/merge_requests/19/
 Patch24: libgcrypt-1.10.0-marvin3.patch
+# https://dev.gnupg.org/T8211.html
+Patch25: libgcrypt-1.11.0-montgomery-zeroes.patch
 
 %global gcrylibdir %{_libdir}
 %global gcrysoname libgcrypt.so.20
@@ -145,6 +147,7 @@ applications using libgcrypt.
 %patch22 -p1
 %patch23 -p1
 %patch24 -p1
+%patch25 -p1
 
 %build
 # This package has a configure test which uses ASMs, but does not link the
@@ -265,6 +268,12 @@ mkdir -p -m 755 $RPM_BUILD_ROOT/etc/gcrypt
 %license COPYING
 
 %changelog
+* Tue Jun 30 2026 Jakub Jelen <jjelen@redhat.com> - 1.10.0-13
+- Bump version to fix wrong build target.
+
+* Fri Jun 26 2026 Jakub Jelen <jjelen@redhat.com> - 1.10.0.12
+- Fix CVE-2026-41989: Denial of Service and buffer overflow via crafted ECDH ciphertext
+
 * Thu Aug 01 2024 Jakub Jelen <jjelen@redhat.com> - 1.10.0-11
 - Fix CVE-2024-2236 (RHEL-34579)
 
