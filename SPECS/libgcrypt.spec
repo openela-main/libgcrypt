@@ -15,7 +15,7 @@ print(string.sub(hash, 0, 16))
 
 Name: libgcrypt
 Version: 1.11.0
-Release: 5%{?dist}
+Release: 7%{?dist}
 URL: https://www.gnupg.org/
 Source0: https://www.gnupg.org/ftp/gcrypt/libgcrypt/libgcrypt-%{version}.tar.bz2
 Source1: https://www.gnupg.org/ftp/gcrypt/libgcrypt/libgcrypt-%{version}.tar.bz2.sig
@@ -31,6 +31,8 @@ Patch4: libgcrypt-1.11.0-cf-protection.patch
 Patch5: libgcrypt-1.11.0-pac-bti-protection.patch
 # https://gitlab.com/redhat-crypto/libgcrypt/libgcrypt-mirror/-/merge_requests/19/
 Patch6: libgcrypt-1.11.0-marvin.patch
+# https://dev.gnupg.org/T8211.html
+Patch7: libgcrypt-1.11.0-montgomery-zeroes.patch
 
 %global gcrylibdir %{_libdir}
 %global gcrysoname libgcrypt.so.20
@@ -71,6 +73,7 @@ applications using libgcrypt.
 %patch 4 -p1
 %patch 5 -p1
 %patch 6 -p1
+%patch 7 -p1
 
 %build
 # should be all algorithms except SM3 and SM4, aria
@@ -101,7 +104,15 @@ make check
 # try in faked FIPS mode too
 LIBGCRYPT_FORCE_FIPS_MODE=1 make check
 
+# annocheck currently fails on riscv64 with the following error:
+#
+#   MAYB: test: gaps, reason: not all of the .text section is covered by notes
+#   Overall: FAIL (due to MAYB results).
+#
+# Disable it on the architecture until the issue can be sorted out.
+%ifnarch riscv64
 PROFILE=%{?dist} annocheck --ignore-unknown --verbose --profile=${PROFILE:1} $RPM_BUILD_ROOT%{gcrylibdir}/libgcrypt.so.20.5.0
+%endif
 
 
 # Add generation of HMAC checksums of the final stripped binaries 
@@ -185,6 +196,13 @@ mkdir -p -m 755 $RPM_BUILD_ROOT/etc/gcrypt
 %license COPYING
 
 %changelog
+* Fri Jun 26 2026 Jakub Jelen <jjelen@redhat.com> - 1.11.0-7
+- Fix CVE-2026-41989: Denial of Service and buffer overflow via crafted ECDH ciphertext
+
+* Tue Apr 29 2025 Andrea Bolognani <abologna@redhat.com> - 1.11.0-6
+- Disable annocheck on riscv64 (fixes build)
+  Resolves: RHEL-88837
+
 * Tue Oct 29 2024 Troy Dawson <tdawson@redhat.com> - 1.11.0-5
 - Bump release for October 2024 mass rebuild:
   Resolves: RHEL-64018
